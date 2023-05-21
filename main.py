@@ -2,7 +2,7 @@ import transformers
 from itertools import chain
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser, TrainingArguments, BitsAndBytesConfig
 from datasets import load_dataset
-from peft import TaskType, LoraConfig, PeftConfig, PeftModel, get_peft_model
+from peft import TaskType, LoraConfig, PeftConfig, PeftModel, get_peft_model, prepare_model_for_int8_training
 from typing import Optional
 import torch
 from dataclasses import dataclass, field
@@ -43,7 +43,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, device_map="auto").cuda()
+model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, load_in_8bit=True ,device_map="auto").cuda()
 
 target_modules = ["query_key_value", "xxx"]
 peft_config = LoraConfig(
@@ -51,7 +51,23 @@ peft_config = LoraConfig(
 )
 
 # Enable grads for checkpointing
-model.enable_input_require_grads()
+# model.enable_input_require_grads()
+model = prepare_model_for_int8_training(model)
+
+if hasattr(model, "embed_out"):
+    output_embedding_layer = getattr(model, "embed_out")
+    input_dtype = output_embedding_layer.weight.dtype
+
+    class CastOutputToFloat(torch.nn.Sequential):
+        r"""
+        Manually cast to the expected dtype of the lm_head as sometimes there is a final layer norm that is casted
+        in fp32
+        """
+
+        def forward(self, x):
+            return super().forward(x.to(input_dtype)).to(torch.float32)
+
+    setattr(model, "embed_out", CastOutputToFloat(output_embedding_layer))
 
 model = get_peft_model(model, peft_config)
 
@@ -62,7 +78,7 @@ data = load_dataset(data_args.dataset_name, data_args.dataset_language)
 columns = data["train"].features
 
 def filter_longer(sample):
-    tokens, attn_mask = tokenizer(sample["whole_func_string"])
+    tokens, _attn_mask = tokenizer(sample["whole_func_string"])
 
     return len(tokens) <= block_size
 
