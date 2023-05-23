@@ -59,6 +59,13 @@ dataloader = data.prepare(
 
 This can be used to great effect when overriding the `dataset` method in a subclass of `Pipeline`.
 
+## Setup
+
+```
+pip install ditty
+```
+
+
 ## Tips
 
 https://github.com/google/python-fire is a tool for autogenerating CLIs from Python functions, dicts and objects.
