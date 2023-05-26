@@ -55,7 +55,7 @@ class Data:
         if self.group_by_length:
             lengths = (
                 self.dataset[self.length_column_name]
-                if self.args.length_column_name in self.dataset.column_names
+                if self.length_column_name in self.dataset.column_names
                 else None
             )
             model_input_name = self.tokenizer.model_input_names[0]
@@ -99,7 +99,11 @@ class Data:
 
         for op_name, func, kwargs in pipeline:
             op = getattr(self.dataset, op_name)
-            self.dataset = op(func, **kwargs)
+
+            if not func:
+                self.dataset = op(**kwargs)
+            else:
+                self.dataset = op(func, **kwargs)
 
         return self._get_dataloader()        
 

@@ -11,6 +11,7 @@ import atexit
 
 import numpy as np
 import random
+import contextlib
 
 from peft import PeftModelForCausalLM
 from logging import getLogger
@@ -56,6 +57,7 @@ class Trainer():
     grad_accum: int = 1
     accelerator_kwargs: dict = field(default_factory=dict)
     fp16: bool = False
+    use_bfloat16: bool = False
     output_dir: str = "./output"
     checkpoint_every: int = 1000
     load_checkpoint: bool = False
@@ -71,6 +73,11 @@ class Trainer():
 
         if self.use_scheduler and not self.scheduler:
             self.scheduler = default_scheduler_factory(self.optimizer)
+
+        if self.fp16 and self.use_bfloat16:
+            self.f16_dtype = torch.bfloat16
+        elif self.fp16:
+            self.f16_dtype = torch.float16
 
         acc_kwargs = {
             "gradient_accumulation_steps": self.grad_accum,
@@ -109,6 +116,12 @@ class Trainer():
             self._save_dist()
 
     def _train_accelerate(self, epochs=1, max_steps=None):
+        context_manager =  contextlib.nullcontext()
+
+        if self.fp16:
+            context_manager = torch.cuda.amp.autocast(cache_enabled=False, dtype=self.f16_dtype)
+
+
         self.model.train()
 
         if self.load_checkpoint:
@@ -137,8 +150,9 @@ class Trainer():
 
             for batch_idx, batch in enumerate(dataset):
                 with self.accelerator.accumulate(self.model):
-                    outputs = self.model(**batch)
-                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                    with context_manager:
+                        outputs = self.model(**batch)
+                        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
                     self.accelerator.backward(loss)
 
