@@ -7,6 +7,13 @@ A very simple library for finetuning Huggingface Pretrained AutoModelForCausalLM
 
 Ditty has support for LORA, 8bit, and fp32 cpu offloading right out of the box and assumes you are running with a single GPU or distributed over multiple GPUs by default.
 
+Checkpointing supported, currently a bug with pushing to HF model hub though so checkpoints are all local.
+
+FP16, BFLOAT16 now supported.
+
+QLORA 4bit supported under experimental, and requires installing development branches of accelerate, peft, transformers and the latest bitsandbytes.
+
+
 ## What Not
 - Ditty does not support ASICs like TPU or Trainium.
 - Ditty does not handle Sagemaker
@@ -14,7 +21,6 @@ Ditty has support for LORA, 8bit, and fp32 cpu offloading right out of the box a
 - Ditty does not handle evaluation sets or benchmarking, this may or may not change.
 
 ## Soon
-- Ditty will handle FP16
 - Ditty may handle distributed cluster finetuning
 - Ditty will support DeepSpeed
 
