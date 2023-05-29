@@ -1,4 +1,6 @@
 from dataclasses import dataclass, field
+import time
+from .utils import convert
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -8,6 +10,7 @@ from transformers.trainer_pt_utils import (
     get_model_param_count,
 )
 import atexit
+
 
 import numpy as np
 import random
@@ -123,6 +126,8 @@ class Trainer():
 
 
         self.model.train()
+        total_batches = len(self.dataset) * epochs
+        start_time = time.time()
 
         if self.load_checkpoint:
             try:
@@ -163,7 +168,22 @@ class Trainer():
 
                     batch_loss = loss.item() / self.grad_accum
 
-                    print(f"Epoch {ep} | Batch {batch_idx} | Loss {batch_loss}")
+                    # calculate current epoch as decimal
+                    total_batches_done = ep * len(self.dataset) + batch_idx
+                    current_epoch_decimal = total_batches_done / total_batches
+
+                    # calculate time elapsed and estimate remaining time
+                    time_elapsed = time.time() - start_time
+                    batches_remaining = total_batches - total_batches_done
+                    estimated_time_remaining = (time_elapsed / total_batches_done) * batches_remaining if total_batches_done > 0 else 0
+
+                    # convert estimated_time_remaining to format: dd days, hh hours, mm minutes, ss seconds
+                    estimated_time_remaining_ddhhmmss = convert(estimated_time_remaining)
+
+                    # calculate percentage done
+                    percent_done = (total_batches_done / total_batches) * 100
+
+                    print(f"Epoch {current_epoch_decimal:.2f} | Batch {batch_idx}/{len(self.dataset)} | Loss {batch_loss} | {percent_done:.2f}% done | Estimated time remaining: {estimated_time_remaining_ddhhmmss}")
 
                     self.state.global_loss += batch_loss
 
