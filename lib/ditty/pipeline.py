@@ -78,6 +78,9 @@ class Pipeline:
             self.bnb_config = BitsAndBytesConfig(
                 load_in_8bit=l8bit, llm_int8_enable_fp32_cpu_offload=fp32_cpu_offload
             )
+        else:
+            self.bnb_config = None
+
         self.checkpoint_every = checkpoint_every
         self.load_checkpoint = load_checkpoint
         self.gradient_checkpointing = gradient_checkpointing
