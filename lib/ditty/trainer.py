@@ -128,17 +128,28 @@ class Trainer():
         self.model.train()
         total_batches = len(self.dataset) * epochs
         start_time = time.time()
-
+        
+        
+       
         if self.load_checkpoint:
             try:
-                last_cp = sorted(os.listdir(f"{self.output_dir}/checkpoints/"))[-1]
-                logger.info(f"Trying to load checkpoint: {last_cp}....")
-                self.accelerator.load_state(f"{self.output_dir}/checkpoints/{last_cp}")
+                checkpoints_dir = f"{self.output_dir}/checkpoints/"
+                
+                if os.path.exists(checkpoints_dir) and os.listdir(checkpoints_dir):
+                    last_cp = sorted(os.listdir(checkpoints_dir))[-1]
+                    logger.info(f"Trying to load checkpoint: {last_cp}....")
+                    last_cp = sorted(os.listdir(f"{self.output_dir}/checkpoints/"))[-1]
+                    logger.info(f"Trying to load checkpoint: {last_cp}....")
+                    self.accelerator.load_state(f"{self.output_dir}/checkpoints/{last_cp}")
 
-                # Update the iteration number so that the next checkpoint name is increased by 1
-                last_cp_num = last_cp.split("_")[-1]
-                self.accelerator.project_configuration.iteration = int(last_cp_num) + 1
-                logger.info("Checkpoint loaded.")
+                    # Update the iteration number so that the next checkpoint name is increased by 1
+                    last_cp_num = last_cp.split("_")[-1]
+                    self.accelerator.project_configuration.iteration = int(last_cp_num) + 1
+                    logger.info("Checkpoint loaded.")
+                else:
+                    logger.warning("No checkpoint found, starting from scratch.")
+                    self._save(no_dist=True)
+                    
             except FileNotFoundError as e:
                 logger.warning(e)
                 logger.warning("No checkpoint found, starting from scratch.")
