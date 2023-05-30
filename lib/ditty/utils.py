@@ -1,4 +1,4 @@
-def convertSecondsToStringTime(seconds): 
+def convert_seconds_to_string_time(seconds): 
     day = seconds // (24 * 3600) 
     seconds = seconds % (24 * 3600) 
     hour = seconds // 3600
