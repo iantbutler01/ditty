@@ -1,6 +1,4 @@
-import time
-
-def convert(seconds): 
+def convertSecondsToStringTime(seconds): 
     day = seconds // (24 * 3600) 
     seconds = seconds % (24 * 3600) 
     hour = seconds // 3600

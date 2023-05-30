@@ -42,6 +42,7 @@ class Pipeline:
         experimental=False,
         block_size=2048,
         use_bfloat16=False,
+        model_load_kwargs={},
     ):
         self.output_dir = output_dir
         self.dataset_name = dataset_name
@@ -61,6 +62,7 @@ class Pipeline:
         self.block_size = block_size
         self.fp32_cpu_offload = fp32_cpu_offload
         self.use_bfloat16 = use_bfloat16
+        self.model_load_kwargs = model_load_kwargs
 
         if self.l8bit and self.l4bit:
             raise ValueError("Cannot set both l8bit and l4bit to True.")
@@ -134,7 +136,8 @@ class Pipeline:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name_or_path,
             device_map="auto",
-            quantization_config=self.bnb_config
+            quantization_config=self.bnb_config,
+            **self.model_load_kwargs,
         )
 
         target_modules = None

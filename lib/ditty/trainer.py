@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 import time
-from .utils import convert
+from .utils import convertSecondsToStringTime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -178,7 +178,7 @@ class Trainer():
                     estimated_time_remaining = (time_elapsed / total_batches_done) * batches_remaining if total_batches_done > 0 else 0
 
                     # convert estimated_time_remaining to format: dd days, hh hours, mm minutes, ss seconds
-                    estimated_time_remaining_ddhhmmss = convert(estimated_time_remaining)
+                    estimated_time_remaining_ddhhmmss = convertSecondsToStringTime(estimated_time_remaining)
 
                     # calculate percentage done
                     percent_done = (total_batches_done / total_batches) * 100
