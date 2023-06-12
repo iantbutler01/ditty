@@ -27,6 +27,12 @@ from transformers import (
 
 def default_scheduler_factory(optimizer):
     return torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+  
+def get_number_from_checkpoint(filename):
+    parts = filename.split('_')
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
 
 logger = getLogger()
 
@@ -118,42 +124,48 @@ class Trainer():
         if not no_dist:
             self._save_dist()
 
-    def _train_accelerate(self, epochs=1, max_steps=None):
-        context_manager =  contextlib.nullcontext()
 
-        if self.fp16:
-            context_manager = torch.cuda.amp.autocast(cache_enabled=False, dtype=self.f16_dtype)
+    def _load_last_checkpoint(self):
+        try:
+            checkpoints_dir = f"{self.output_dir}/checkpoints/"
 
+            if os.path.exists(checkpoints_dir) and os.listdir(checkpoints_dir):
+                files = os.listdir(checkpoints_dir)
+                checkpoint_files = [f for f in files if f.startswith('checkpoint_') and get_number_from_checkpoint(f) is not None]
+                checkpoint_files_sorted = sorted(checkpoint_files, key=get_number_from_checkpoint)
 
-        self.model.train()
-        total_batches = len(self.dataset) * epochs
-        start_time = time.time()
-        
-        
-       
-        if self.load_checkpoint:
-            try:
-                checkpoints_dir = f"{self.output_dir}/checkpoints/"
-                
-                if os.path.exists(checkpoints_dir) and os.listdir(checkpoints_dir):
-                    last_cp = sorted(os.listdir(checkpoints_dir))[-1]
-                    logger.info(f"Trying to load checkpoint: {last_cp}....")
-                    last_cp = sorted(os.listdir(f"{self.output_dir}/checkpoints/"))[-1]
+                if checkpoint_files_sorted:
+                    last_cp = checkpoint_files_sorted[-1]
                     logger.info(f"Trying to load checkpoint: {last_cp}....")
                     self.accelerator.load_state(f"{self.output_dir}/checkpoints/{last_cp}")
 
                     # Update the iteration number so that the next checkpoint name is increased by 1
                     last_cp_num = last_cp.split("_")[-1]
                     self.accelerator.project_configuration.iteration = int(last_cp_num) + 1
-                    logger.info("Checkpoint loaded.")
-                else:
-                    logger.warning("No checkpoint found, starting from scratch.")
-                    self._save(no_dist=True)
-                    
-            except FileNotFoundError as e:
-                logger.warning(e)
-                logger.warning("No checkpoint found, starting from scratch.")
-                self._save(no_dist=True)
+                    return last_cp
+
+        except FileNotFoundError as e:
+            logger.warning(e)
+        return None
+
+    def _train_accelerate(self, epochs=1, max_steps=None):
+        context_manager =  contextlib.nullcontext()
+
+        if self.fp16:
+            context_manager = torch.cuda.amp.autocast(cache_enabled=False, dtype=self.f16_dtype)
+
+        self.model.train()
+        total_batches = len(self.dataset) * epochs
+        start_time = time.time()
+
+        if self.load_checkpoint:
+            last_cp = self._load_last_checkpoint()
+            if last_cp:
+              logger.info(f"Checkpoint loaded: {last_cp}.")
+            else:
+              logger.warning("No checkpoint found, starting from scratch.")
+              self._save(no_dist=True)
+
         else:
             self._save(no_dist=True)
 
