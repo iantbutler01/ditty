@@ -8,13 +8,19 @@ from transformers.trainer_pt_utils import (
     LengthGroupedSampler,
 )
 from transformers.trainer_utils import RemoveColumnsCollator, set_seed
-from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, DataCollatorForLanguageModeling, default_data_collator
+from transformers.data.data_collator import (
+    DataCollator,
+    DataCollatorWithPadding,
+    DataCollatorForLanguageModeling,
+    default_data_collator,
+)
 from transformers import PreTrainedTokenizerBase
 from typing import Callable
 
 from logging import getLogger
 
 logger = getLogger()
+
 
 @dataclass(kw_only=True)
 class Data:
@@ -35,9 +41,9 @@ class Data:
 
     def __post_init__(self):
         if self.dataset is None and self.load_kwargs is None:
-            raise ValueError("dataset and load_kwargs cannot both be None.
-                             Please either pass an instance of Dataset or a
-                             dict of args to load the dataset with.")
+            raise ValueError(
+                "dataset and load_kwargs cannot both be None.  Please either pass an instance of Dataset or a dict of args to load the dataset with."
+            )
 
         if self.dataset is None:
             kwargs = self.load_kwargs or {}
@@ -45,9 +51,10 @@ class Data:
             self.dataset = datasets.load_dataset(kwargs)[self.split]
 
         if not self.collator:
-            collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, return_tensors="pt", mlm=False)
+            collator = DataCollatorForLanguageModeling(
+                tokenizer=self.tokenizer, return_tensors="pt", mlm=False
+            )
             self.collator = collator
-
 
     def _get_sampler(self) -> Optional[torch.utils.data.Sampler]:
         generator = torch.Generator()
@@ -74,7 +81,8 @@ class Data:
             return RandomSampler(self.dataset, generator=generator)
 
     def _get_collator_with_removed_columns(
-        self, data_collator: Callable,
+        self,
+        data_collator: Callable,
     ) -> Callable:
         """Wrap the data collator in a callable removing unused columns."""
         if not self.remove_unused_columns:
