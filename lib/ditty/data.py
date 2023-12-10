@@ -29,7 +29,7 @@ class Data:
     dataloader_num_workers: int = 0
     dataloader_pin_memory: bool = True
     dataloader_drop_last: bool = False
-    load_kwargs: dict = {}
+    load_kwargs: Optional[dict] = None
     collator: Optional[DataCollator] = None
     remove_unused_columns: bool = False
 
@@ -38,7 +38,9 @@ class Data:
             raise ValueError("Dataset and load_args cannot both be None. Please either pass an instance of Dataset or a list of args to load the dataset with.")
 
         if self.dataset is None:
-            self.dataset = datasets.load_dataset(**self.load_kwargs)[self.split]
+            kwargs = self.load_kwargs or {}
+
+            self.dataset = datasets.load_dataset(kwargs)[self.split]
 
         if not self.collator:
             collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, return_tensors="pt", mlm=False)
