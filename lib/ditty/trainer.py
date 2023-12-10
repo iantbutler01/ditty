@@ -21,23 +21,25 @@ from logging import getLogger
 from typing import Optional
 import os
 
-from transformers import (
-    PreTrainedModel
-)
+from transformers import PreTrainedModel
+
 
 def default_scheduler_factory(optimizer):
     return torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-  
+
+
 def get_number_from_checkpoint(filename):
-    parts = filename.split('_')
+    parts = filename.split("_")
     if len(parts) != 2 or not parts[1].isdigit():
         return None
     return int(parts[1])
 
+
 logger = getLogger()
 
+
 @dataclass(kw_only=True)
-class TrainerState():
+class TrainerState:
     epoch: int = 0
     steps: int = 0
     global_loss: int = 0
@@ -48,7 +50,7 @@ class TrainerState():
             "steps": self.steps,
             "global_loss": self.global_loss,
         }
-    
+
     def load_state_dict(self, state_dict):
         self.epoch = state_dict["epoch"]
         self.steps = state_dict["steps"]
@@ -56,7 +58,7 @@ class TrainerState():
 
 
 @dataclass(kw_only=True)
-class Trainer():
+class Trainer:
     model: nn.Module
     optimizer: torch.optim.Optimizer
     dataset: DataLoader
@@ -94,7 +96,7 @@ class Trainer():
             "project_config": ProjectConfiguration(
                 project_dir=self.output_dir,
                 automatic_checkpoint_naming=True,
-            )
+            ),
         }
 
         acc_kwargs = {**acc_kwargs, **self.accelerator_kwargs}
@@ -104,11 +106,20 @@ class Trainer():
         self.device = device
 
         if self.use_scheduler:
-            self.model, self.optimizer, self.dataset, self.scheduler = self.accelerator.prepare(self.model, self.optimizer, self.dataset, self.scheduler)
+            (
+                self.model,
+                self.optimizer,
+                self.dataset,
+                self.scheduler,
+            ) = self.accelerator.prepare(
+                self.model, self.optimizer, self.dataset, self.scheduler
+            )
 
             self.accelerator.register_for_checkpointing(self.scheduler)
         else:
-            self.model, self.optimizer, self.dataset = self.accelerator.prepare(self.model, self.optimizer, self.dataset)
+            self.model, self.optimizer, self.dataset = self.accelerator.prepare(
+                self.model, self.optimizer, self.dataset
+            )
 
         self.state = TrainerState()
         self.accelerator.register_for_checkpointing(self.state)
@@ -119,11 +130,10 @@ class Trainer():
         model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state)
 
     def _save(self, no_dist=False):
-        self.accelerator.wait_for_everyone() 
+        self.accelerator.wait_for_everyone()
         self.accelerator.save_state()
         if not no_dist:
             self._save_dist()
-
 
     def _load_last_checkpoint(self):
         try:
@@ -131,17 +141,28 @@ class Trainer():
 
             if os.path.exists(checkpoints_dir) and os.listdir(checkpoints_dir):
                 files = os.listdir(checkpoints_dir)
-                checkpoint_files = [f for f in files if f.startswith('checkpoint_') and get_number_from_checkpoint(f) is not None]
-                checkpoint_files_sorted = sorted(checkpoint_files, key=get_number_from_checkpoint)
+                checkpoint_files = [
+                    f
+                    for f in files
+                    if f.startswith("checkpoint_")
+                    and get_number_from_checkpoint(f) is not None
+                ]
+                checkpoint_files_sorted = sorted(
+                    checkpoint_files, key=get_number_from_checkpoint
+                )
 
                 if checkpoint_files_sorted:
                     last_cp = checkpoint_files_sorted[-1]
                     logger.info(f"Trying to load checkpoint: {last_cp}....")
-                    self.accelerator.load_state(f"{self.output_dir}/checkpoints/{last_cp}")
+                    self.accelerator.load_state(
+                        f"{self.output_dir}/checkpoints/{last_cp}"
+                    )
 
                     # Update the iteration number so that the next checkpoint name is increased by 1
                     last_cp_num = last_cp.split("_")[-1]
-                    self.accelerator.project_configuration.iteration = int(last_cp_num) + 1
+                    self.accelerator.project_configuration.iteration = (
+                        int(last_cp_num) + 1
+                    )
                     return last_cp
 
         except FileNotFoundError as e:
@@ -149,10 +170,12 @@ class Trainer():
         return None
 
     def _train_accelerate(self, epochs=1, max_steps=None):
-        context_manager =  contextlib.nullcontext()
+        context_manager = contextlib.nullcontext()
 
         if self.fp16:
-            context_manager = torch.cuda.amp.autocast(cache_enabled=False, dtype=self.f16_dtype)
+            context_manager = torch.cuda.amp.autocast(
+                cache_enabled=False, dtype=self.f16_dtype
+            )
 
         self.model.train()
         total_batches = len(self.dataset) * epochs
@@ -161,10 +184,10 @@ class Trainer():
         if self.load_checkpoint:
             last_cp = self._load_last_checkpoint()
             if last_cp:
-              logger.info(f"Checkpoint loaded: {last_cp}.")
+                logger.info(f"Checkpoint loaded: {last_cp}.")
             else:
-              logger.warning("No checkpoint found, starting from scratch.")
-              self._save(no_dist=True)
+                logger.warning("No checkpoint found, starting from scratch.")
+                self._save(no_dist=True)
 
         else:
             self._save(no_dist=True)
@@ -174,22 +197,25 @@ class Trainer():
             dataset = self.dataset
 
             if self.state.steps > 0:
-                dataset = self.accelerator.skip_first_batches(self.dataset, self.state.steps)
+                dataset = self.accelerator.skip_first_batches(
+                    self.dataset, self.state.steps
+                )
 
             for batch_idx, batch in enumerate(dataset):
                 with self.accelerator.accumulate(self.model):
                     with context_manager:
                         outputs = self.model(**batch)
-                        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                        loss = (
+                            outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                        )
 
-                    self.accelerator.backward(loss)
+                    batch_loss = loss.item()
+                    self.accelerator.backward(batch_loss)
 
                     self.optimizer.step()
                     if self.use_scheduler:
                         self.scheduler.step()
                     self.optimizer.zero_grad()
-
-                    batch_loss = loss.item() / self.grad_accum
 
                     # calculate current epoch as decimal
                     total_batches_done = ep * len(self.dataset) + batch_idx
@@ -198,15 +224,23 @@ class Trainer():
                     # calculate time elapsed and estimate remaining time
                     time_elapsed = time.time() - start_time
                     batches_remaining = total_batches - total_batches_done
-                    estimated_time_remaining = (time_elapsed / total_batches_done) * batches_remaining if total_batches_done > 0 else 0
+                    estimated_time_remaining = (
+                        (time_elapsed / total_batches_done) * batches_remaining
+                        if total_batches_done > 0
+                        else 0
+                    )
 
                     # convert estimated_time_remaining to format: dd days, hh hours, mm minutes, ss seconds
-                    estimated_time_remaining_ddhhmmss = convert_seconds_to_string_time(estimated_time_remaining)
+                    estimated_time_remaining_ddhhmmss = convert_seconds_to_string_time(
+                        estimated_time_remaining
+                    )
 
                     # calculate percentage done
                     percent_done = (total_batches_done / total_batches) * 100
 
-                    print(f"Epoch {current_epoch_decimal:.2f} | Batch {batch_idx}/{len(self.dataset)} | Loss {batch_loss} | {percent_done:.2f}% done | Estimated time remaining: {estimated_time_remaining_ddhhmmss}")
+                    print(
+                        f"Epoch {current_epoch_decimal:.2f} | Batch {batch_idx}/{len(self.dataset)} | Loss {batch_loss} | {percent_done:.2f}% done | Estimated time remaining: {estimated_time_remaining_ddhhmmss}"
+                    )
 
                     self.state.global_loss += batch_loss
 
@@ -231,7 +265,8 @@ class Trainer():
             logger.info(f"  Total optimization steps = {max_steps:,}")
         logger.info(f"  Instantaneous batch size per device = {self.batch_size:,}")
         logger.info(f"  Gradient Accumulation steps = {self.grad_accum}")
-        logger.info(f"  Number of trainable parameters = {get_model_param_count(self.model, trainable_only=True):,}")
+        logger.info(
+            f"  Number of trainable parameters = {get_model_param_count(self.model, trainable_only=True):,}"
+        )
 
         return self._train_accelerate(epochs=epochs, max_steps=max_steps)
-        
