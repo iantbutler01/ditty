@@ -45,7 +45,8 @@ The primary way of using this class is through the `prepare` method which takes 
 Example:
 ```python
 data = Data(
-    load_args=(self.dataset_name, self.dataset_language),
+    load_kwargs={"path": self.dataset_name, "name":
+                 self.dataset_language},
     tokenizer=self.tokenizer,
     seed=self.seed,
     batch_size=self.batch_size,

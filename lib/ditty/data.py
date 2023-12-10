@@ -29,16 +29,16 @@ class Data:
     dataloader_num_workers: int = 0
     dataloader_pin_memory: bool = True
     dataloader_drop_last: bool = False
-    load_args: Optional[list] = None
+    load_kwargs: dict = {}
     collator: Optional[DataCollator] = None
     remove_unused_columns: bool = False
 
     def __post_init__(self):
         if self.dataset is None and self.load_args is None:
             raise ValueError("Dataset and load_args cannot both be None. Please either pass an instance of Dataset or a list of args to load the dataset with.")
-        
+
         if self.dataset is None:
-            self.dataset = datasets.load_dataset(*self.load_args)[self.split]
+            self.dataset = datasets.load_dataset(**self.load_kwargs)[self.split]
 
         if not self.collator:
             collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, return_tensors="pt", mlm=False)
@@ -105,7 +105,7 @@ class Data:
             else:
                 self.dataset = op(func, **kwargs)
 
-        return self._get_dataloader()        
+        return self._get_dataloader()
 
     def _seed_worker(self):
         if not self.seed:
@@ -114,7 +114,7 @@ class Data:
             worker_seed = self.seed
 
         set_seed(worker_seed)
-    
+
     def _get_dataloader(self) -> DataLoader:
         """
         Returns a [`~torch.utils.data.DataLoader`].
