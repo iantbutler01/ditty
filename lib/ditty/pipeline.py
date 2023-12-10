@@ -42,7 +42,7 @@ class Pipeline:
         experimental=False,
         block_size=2048,
         use_bfloat16=False,
-        model_load_kwargs={},
+        model_load_kwargs={"device_map": "auto"},
     ):
         self.output_dir = output_dir
         self.dataset_name = dataset_name
@@ -138,7 +138,6 @@ class Pipeline:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name_or_path,
-            device_map="auto",
             quantization_config=self.bnb_config,
             **self.model_load_kwargs,
         )
