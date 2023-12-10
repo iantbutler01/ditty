@@ -209,9 +209,8 @@ class Trainer:
                             outputs["loss"] if isinstance(outputs, dict) else outputs[0]
                         )
 
+                    self.accelerator.backward(loss)
                     batch_loss = loss.item()
-                    self.accelerator.backward(batch_loss)
-
                     self.optimizer.step()
                     if self.use_scheduler:
                         self.scheduler.step()
