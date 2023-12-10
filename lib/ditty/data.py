@@ -48,7 +48,7 @@ class Data:
         if self.dataset is None:
             kwargs = self.load_kwargs or {}
 
-            self.dataset = datasets.load_dataset(kwargs)[self.split]
+            self.dataset = datasets.load_dataset(**kwargs)[self.split]
 
         if not self.collator:
             collator = DataCollatorForLanguageModeling(
