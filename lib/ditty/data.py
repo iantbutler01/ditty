@@ -34,8 +34,10 @@ class Data:
     remove_unused_columns: bool = False
 
     def __post_init__(self):
-        if self.dataset is None and self.load_args is None:
-            raise ValueError("Dataset and load_args cannot both be None. Please either pass an instance of Dataset or a list of args to load the dataset with.")
+        if self.dataset is None and self.load_kwargs is None:
+            raise ValueError("dataset and load_kwargs cannot both be None.
+                             Please either pass an instance of Dataset or a
+                             dict of args to load the dataset with.")
 
         if self.dataset is None:
             kwargs = self.load_kwargs or {}
