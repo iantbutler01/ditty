@@ -8,7 +8,7 @@ from peft import (
     TaskType,
     LoraConfig,
     get_peft_model,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
 )
 import torch
 from torch.utils.data import DataLoader
@@ -162,14 +162,9 @@ class Pipeline:
             bias="none",
         )
 
-        if self.l4bit:
-            from peft import prepare_model_for_kbit_training
+        if self.l8bit or self.l4bit:
 
             self.model = prepare_model_for_kbit_training(
-                self.model, use_gradient_checkpointing=self.gradient_checkpointing
-            )
-        elif self.l8bit:
-            self.model = prepare_model_for_int8_training(
                 self.model, use_gradient_checkpointing=self.gradient_checkpointing
             )
 
