@@ -23,8 +23,8 @@ class Pipeline:
     def __init__(
         self,
         output_dir="./output",
-        dataset_name="code_search_net",
-        dataset_language="python",
+        dataset_namespace="code_search_net",
+        dataset_path="python",
         model_name_or_path="theblackcat102/pythia-3b-deduped-sft-r1",
         hf_hub_token=None,
         hf_hub_model_id=None,
@@ -45,8 +45,8 @@ class Pipeline:
         model_load_kwargs={"device_map": "auto"},
     ):
         self.output_dir = output_dir
-        self.dataset_name = dataset_name
-        self.dataset_language = dataset_language
+        self.dataset_namespace = dataset_namespace
+        self.dataset_path = dataset_path
         self.model_name_or_path = model_name_or_path
         self.hf_hub_token = hf_hub_token
         self.hf_hub_model_id = hf_hub_model_id
@@ -93,8 +93,7 @@ class Pipeline:
         """
 
         data = Data(
-            load_kwargs={"path": self.dataset_name, "name":
-                         self.dataset_language},
+            load_kwargs={"path": self.dataset_namespace, "name": self.dataset_path},
             tokenizer=self.tokenizer,
             seed=self.seed,
             batch_size=self.batch_size,
@@ -160,12 +159,12 @@ class Pipeline:
             r=8,
             lora_alpha=16,
             lora_dropout=0.05,
-            bias="none"
+            bias="none",
         )
-
 
         if self.l4bit:
             from peft import prepare_model_for_kbit_training
+
             self.model = prepare_model_for_kbit_training(
                 self.model, use_gradient_checkpointing=self.gradient_checkpointing
             )

@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ditty',
-    version='0.4.0',
+    version='0.5.0',
     license='Apache V2',
     author="Ian T Butler (KinglyCrow)",
     author_email='iantbutler01@gmail.com',
