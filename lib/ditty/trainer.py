@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import set_seed
 from transformers.trainer_pt_utils import (
     get_model_param_count,
 )
@@ -13,15 +13,11 @@ import atexit
 
 
 import numpy as np
-import random
 import contextlib
 
-from peft import PeftModelForCausalLM
 from logging import getLogger
 from typing import Optional
 import os
-
-from transformers import PreTrainedModel
 
 
 def default_scheduler_factory(optimizer):
@@ -61,12 +57,12 @@ class TrainerState:
 class Trainer:
     model: nn.Module
     optimizer: torch.optim.Optimizer
+    accelerator: Accelerator
     dataset: DataLoader
     device: torch.device
     scheduler: torch.optim.lr_scheduler._LRScheduler | None = None
     use_scheduler: bool = True
     grad_accum: int = 1
-    accelerator_kwargs: dict = field(default_factory=dict)
     fp16: bool = False
     use_bfloat16: bool = False
     output_dir: str = "./output"
@@ -90,18 +86,6 @@ class Trainer:
         elif self.fp16:
             self.f16_dtype = torch.float16
 
-        acc_kwargs = {
-            "gradient_accumulation_steps": self.grad_accum,
-            "project_dir": self.output_dir,
-            "project_config": ProjectConfiguration(
-                project_dir=self.output_dir,
-                automatic_checkpoint_naming=True,
-            ),
-        }
-
-        acc_kwargs = {**acc_kwargs, **self.accelerator_kwargs}
-
-        self.accelerator = Accelerator(**acc_kwargs)
         device = self.accelerator.device
         self.device = device
 
@@ -130,12 +114,15 @@ class Trainer:
         model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state)
 
     def _save(self, no_dist=False):
+        return
+
         self.accelerator.wait_for_everyone()
         self.accelerator.save_state()
         if not no_dist:
             self._save_dist()
 
     def _load_last_checkpoint(self):
+        return None
         try:
             checkpoints_dir = f"{self.output_dir}/checkpoints/"
 
@@ -187,7 +174,7 @@ class Trainer:
                 logger.info(f"Checkpoint loaded: {last_cp}.")
             else:
                 logger.warning("No checkpoint found, starting from scratch.")
-                self._save(no_dist=True)
+                # self._save(no_dist=True)
 
         else:
             self._save(no_dist=True)

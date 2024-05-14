@@ -3,13 +3,11 @@ from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig,
 )
+import os
+import bitsandbytes as bnb
+from accelerate import Accelerator, infer_auto_device_map, init_empty_weights
+from accelerate.utils import ProjectConfiguration
 
-from peft import (
-    TaskType,
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
 import torch
 from torch.utils.data import DataLoader
 from .trainer import Trainer
@@ -43,6 +41,10 @@ class Pipeline:
         block_size=2048,
         use_bfloat16=False,
         model_load_kwargs={"device_map": "auto"},
+        accelerator_kwargs={},
+        use_fsdp=False,
+        use_deep_speed=False,
+        use_8bit_optim=False
     ):
         self.output_dir = output_dir
         self.dataset_namespace = dataset_namespace
@@ -63,19 +65,24 @@ class Pipeline:
         self.fp32_cpu_offload = fp32_cpu_offload
         self.use_bfloat16 = use_bfloat16
         self.model_load_kwargs = model_load_kwargs
+        self.accelerator_kwargs = accelerator_kwargs
+        self.use_8bit_optim=use_8bit_optim
+        self.use_fsdp=use_fsdp
+        self.use_deep_speed = use_deep_speed
+
+        if self.use_fsdp and self.use_deep_speed:
+            raise ValueError("Cannot set both use_fsdp and use_deep_speed to True.")
 
         if self.l8bit and self.l4bit:
             raise ValueError("Cannot set both l8bit and l4bit to True.")
 
-        if self.l4bit and experimental:
+        if self.l4bit:
             self.bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
-        elif self.l4bit and not experimental:
-            raise ValueError("To use 4bit, `experimental` must be set to True.")
         elif self.l8bit:
             self.bnb_config = BitsAndBytesConfig(
                 load_in_8bit=l8bit, llm_int8_enable_fp32_cpu_offload=fp32_cpu_offload
@@ -136,11 +143,50 @@ class Pipeline:
 
         data = self.dataset()
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name_or_path,
-            quantization_config=self.bnb_config,
-            **self.model_load_kwargs,
-        )
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+
+        print(f"I am rank: {rank}!")
+        print(self.use_fsdp)
+
+        acc_kwargs = {
+            "gradient_accumulation_steps": self.grad_accum,
+            "project_dir": self.output_dir,
+            "project_config": ProjectConfiguration(
+                project_dir=self.output_dir,
+                automatic_checkpoint_naming=True,
+            ),
+            "mixed_precision": "bf16" if self.use_bfloat16 else "fp16"
+        } 
+
+        acc_kwargs = {**acc_kwargs, **self.accelerator_kwargs}
+
+        self.accelerator = Accelerator(**acc_kwargs)
+
+        modified_load_kwargs = self.model_load_kwargs
+
+        if self.use_fsdp or self.use_deep_speed:
+            if self.use_fsdp:
+                modified_load_kwargs["low_cpu_mem_usage"] = True
+
+            modified_load_kwargs["device_map"] = 0
+            modified_load_kwargs["torch_dtype"] = torch.bfloat16 if self.use_bfloat16 else torch.float16
+            del modified_load_kwargs["device_map"]
+
+        if self.use_fsdp and rank != 0:
+            with init_empty_weights():
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name_or_path,
+                    quantization_config=self.bnb_config,
+                    **modified_load_kwargs,
+                )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name_or_path,
+                quantization_config=self.bnb_config,
+                **modified_load_kwargs,
+            )
 
         target_modules = None
 
@@ -152,18 +198,8 @@ class Pipeline:
         if "rwkv" in self.model_name_or_path:
             target_modules = ["key", "value", "receptance", "xxx"]
 
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            target_modules=target_modules,
-            inference_mode=False,
-            r=8,
-            lora_alpha=16,
-            lora_dropout=0.05,
-            bias="none",
-        )
 
         if self.l8bit or self.l4bit:
-
             self.model = prepare_model_for_kbit_training(
                 self.model, use_gradient_checkpointing=self.gradient_checkpointing
             )
@@ -183,15 +219,33 @@ class Pipeline:
 
             setattr(self.model, "embed_out", CastOutputToFloat(output_embedding_layer))
 
-        self.model = get_peft_model(self.model, peft_config)
+        if self.l8bit or self.l4bit:
+            from peft import (
+                TaskType,
+                LoraConfig,
+                get_peft_model,
+                prepare_model_for_kbit_training,
+            )
+
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                target_modules=target_modules,
+                inference_mode=False,
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                bias="none",
+            )
+
+            self.model = get_peft_model(self.model, peft_config)
 
         ### Training
         if self.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.config.use_cache = (
-            False  # silence the warnings. Please re-enable for inference!
-        )
+        # self.model.config.use_cache = (
+        #     False  # silence the warnings. Please re-enable for inference!
+        # )
 
         adam_beta1 = 0.9
         adam_beta2 = 0.999
@@ -200,13 +254,23 @@ class Pipeline:
             "betas": (adam_beta1, adam_beta2),
             "eps": adam_epsilon,
         }
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=0.97e-5, **adam_kwargs
-        )
+
+        lr=0.97e-5
+
+        if(self.use_fsdp):
+            lr = lr * world_size
+
+        if self.use_8bit_optim:
+            optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=lr, **adam_kwargs)
+        else:
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=lr, **adam_kwargs
+            )
 
         trainer = Trainer(
             model=self.model,
             optimizer=optimizer,
+            accelerator=self.accelerator,
             dataset=data,
             device="cuda",
             grad_accum=self.grad_accum,
