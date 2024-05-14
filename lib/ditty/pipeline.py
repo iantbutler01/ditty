@@ -170,12 +170,10 @@ class Pipeline:
             if self.use_fsdp:
                 modified_load_kwargs["low_cpu_mem_usage"] = True
 
-            modified_load_kwargs["device_map"] = 0
+            del modified_load_kwargs["device_map"]
             modified_load_kwargs["torch_dtype"] = torch.bfloat16 if self.use_bfloat16 else torch.float16
 
-        if self.use_fsdp and rank != 0:
-            del modified_load_kwargs["device_map"]
-
+        if (self.use_fsdp or self.use_deep_speed) and rank != 0:
             with init_empty_weights():
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name_or_path,
