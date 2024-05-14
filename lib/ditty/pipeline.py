@@ -172,9 +172,10 @@ class Pipeline:
 
             modified_load_kwargs["device_map"] = 0
             modified_load_kwargs["torch_dtype"] = torch.bfloat16 if self.use_bfloat16 else torch.float16
-            del modified_load_kwargs["device_map"]
 
         if self.use_fsdp and rank != 0:
+            del modified_load_kwargs["device_map"]
+
             with init_empty_weights():
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name_or_path,
