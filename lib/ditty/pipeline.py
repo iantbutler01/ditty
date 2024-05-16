@@ -152,7 +152,6 @@ class Pipeline:
 
         acc_kwargs = {
             "gradient_accumulation_steps": self.grad_accum,
-            "processes_per_node": num_gpus,
             "project_dir": self.output_dir,
             "project_config": ProjectConfiguration(
                 project_dir=self.output_dir,
