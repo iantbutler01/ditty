@@ -148,7 +148,6 @@ class Pipeline:
         world_size = int(os.environ["WORLD_SIZE"])
 
         print(f"I am rank: {rank}!")
-        print(self.use_fsdp)
 
         acc_kwargs = {
             "gradient_accumulation_steps": self.grad_accum,
@@ -163,6 +162,8 @@ class Pipeline:
         acc_kwargs = {**acc_kwargs, **self.accelerator_kwargs}
 
         self.accelerator = Accelerator(**acc_kwargs)
+
+        print(self.accelerator)
 
         modified_load_kwargs = self.model_load_kwargs
 
