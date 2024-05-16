@@ -143,6 +143,7 @@ class Pipeline:
 
         data = self.dataset()
 
+        num_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
         local_rank = int(os.environ["LOCAL_RANK"])
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -151,6 +152,7 @@ class Pipeline:
 
         acc_kwargs = {
             "gradient_accumulation_steps": self.grad_accum,
+            "processes_per_node": num_gpus,
             "project_dir": self.output_dir,
             "project_config": ProjectConfiguration(
                 project_dir=self.output_dir,
