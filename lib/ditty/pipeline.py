@@ -202,9 +202,6 @@ class Pipeline:
                 **modified_load_kwargs,
             )
 
-            if self.l4bit:
-                self.model.to("cuda")
-
         target_modules = "all-linear"
 
         print(self.model)
