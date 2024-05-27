@@ -152,10 +152,10 @@ class Pipeline:
 
         data = self.dataset()
 
-        num_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
+        num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES","").split(","))
+        local_rank = int(os.environ.get("LOCAL_RANK"))
+        rank = int(os.environ.get("RANK"))
+        world_size = int(os.environ.get("WORLD_SIZE"))
 
         print(f"I am rank: {rank} and local rank {local_rank}!")
 
