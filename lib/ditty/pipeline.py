@@ -158,7 +158,7 @@ class Pipeline:
             rank = int(os.environ.get("RANK"))
             world_size = int(os.environ.get("WORLD_SIZE"))
 
-        print(f"I am rank: {rank} and local rank {local_rank}!")
+            print(f"I am rank: {rank} and local rank {local_rank}!")
 
         acc_kwargs = {
             "gradient_accumulation_steps": self.grad_accum,
