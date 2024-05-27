@@ -3,6 +3,8 @@ from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig,
 )
+
+from typing import Optional, List, Dict, Any
 import os
 import bitsandbytes as bnb
 from accelerate import Accelerator, infer_auto_device_map, init_empty_weights
@@ -20,31 +22,35 @@ logging.basicConfig(level=logging.INFO)
 class Pipeline:
     def __init__(
         self,
-        output_dir="./output",
-        dataset_namespace="code_search_net",
-        dataset_path="python",
-        model_name_or_path="theblackcat102/pythia-3b-deduped-sft-r1",
-        hf_hub_token=None,
-        hf_hub_model_id=None,
-        fp16=True,
-        l8bit=True,
-        l4bit=False,
-        seed=None,
-        batch_size=4,
-        grad_accum=4,
-        push_to_hub=True,
-        fp32_cpu_offload=False,
-        load_checkpoint=True,
-        checkpoint_every=1000,
-        gradient_checkpointing=True,
-        experimental=False,
-        block_size=2048,
-        use_bfloat16=False,
-        model_load_kwargs={"device_map": "auto"},
-        accelerator_kwargs={},
-        use_fsdp=False,
-        use_deep_speed=False,
-        use_8bit_optim=False
+        output_dir: str = "./output",
+        dataset_namespace: str = "code_search_net",
+        dataset_path: str = "python",
+        model_name_or_path: str = "theblackcat102/pythia-3b-deduped-sft-r1",
+        hf_hub_token: Optional[str] = None,
+        hf_hub_model_id: Optional[str] = None,
+        fp16: bool = True,
+        l8bit: bool = True,
+        l4bit: bool = False,
+        seed: int = None,
+        batch_size: int = 4,
+        grad_accum: int = 4,
+        push_to_hub: bool = True,
+        fp32_cpu_offload: bool = False,
+        load_checkpoint: bool = True,
+        checkpoint_every: int = 1000,
+        gradient_checkpointing: bool = True,
+        experimental: bool = False,
+        block_size: int = 2048,
+        use_bfloat16: int = False,
+        model_load_kwargs: Dict[str, Any] = {"device_map": "auto"},
+        accelerator_kwargs: Dict[str, Any] = {},
+        use_fsdp: bool = False,
+        use_deep_speed: bool = False,
+        use_8bit_optim: bool = False,
+        use_qdora: bool = False,
+        peft_config: bool = None,
+        epochs: int = 1,
+        max_steps: Optional[int] = None
     ):
         self.output_dir = output_dir
         self.dataset_namespace = dataset_namespace
@@ -54,8 +60,8 @@ class Pipeline:
         self.hf_hub_model_id = hf_hub_model_id
         self.fp16 = fp16
         self.seed = seed
-        self.epochs = 1
-        self.max_steps = None
+        self.epochs = epochs
+        self.max_steps = max_steps
         self.l8bit = l8bit
         self.l4bit = l4bit
         self.push_to_hub = push_to_hub
@@ -69,6 +75,8 @@ class Pipeline:
         self.use_8bit_optim=use_8bit_optim
         self.use_fsdp=use_fsdp
         self.use_deep_speed = use_deep_speed
+        self.peft_config = peft_config
+        self.use_qdora = use_qdora
 
         if self.use_fsdp and self.use_deep_speed:
             raise ValueError("Cannot set both use_fsdp and use_deep_speed to True.")
@@ -168,27 +176,26 @@ class Pipeline:
 
         if self.use_fsdp or self.use_deep_speed:
             if self.use_fsdp:
-                modified_load_kwargs["low_cpu_mem_usage"] = True
+                modified_load_kwargs["low_cpu_mem_usage"] = False
 
             del modified_load_kwargs["device_map"]
             modified_load_kwargs["torch_dtype"] = torch.bfloat16 if self.use_bfloat16 else torch.float16
 
-        # if (self.use_fsdp or self.use_deep_speed) and rank != 0:
-        #     with init_empty_weights():
-        #         self.model = AutoModelForCausalLM.from_pretrained(
-        #             self.model_name_or_path,
-        #             quantization_config=self.bnb_config,
-        #             **modified_load_kwargs,
-        #         )
-        # else:
-        #     print("WE ARE HERE")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name_or_path,
-            quantization_config=self.bnb_config,
-            **modified_load_kwargs,
-        )
+        if self.use_fsdp and local_rank != 0:
+            with init_empty_weights():
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name_or_path,
+                    quantization_config=self.bnb_config,
+                    **modified_load_kwargs,
+                )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name_or_path,
+                quantization_config=self.bnb_config,
+                **modified_load_kwargs,
+            )
 
-        target_modules = None
+        target_modules = "all-linear"
 
         print(self.model)
 
@@ -235,6 +242,7 @@ class Pipeline:
                 lora_alpha=16,
                 lora_dropout=0.05,
                 bias="none",
+                use_dora=self.use_qdora
             )
 
             self.model = get_peft_model(self.model, peft_config)
@@ -243,9 +251,9 @@ class Pipeline:
         if self.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # self.model.config.use_cache = (
-        #     False  # silence the warnings. Please re-enable for inference!
-        # )
+        self.model.config.use_cache = (
+            False  # silence the warnings. Please re-enable for inference!
+        )
 
         adam_beta1 = 0.9
         adam_beta2 = 0.999
