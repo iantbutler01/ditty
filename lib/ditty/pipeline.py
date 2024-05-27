@@ -152,10 +152,11 @@ class Pipeline:
 
         data = self.dataset()
 
-        num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES","").split(","))
-        local_rank = int(os.environ.get("LOCAL_RANK"))
-        rank = int(os.environ.get("RANK"))
-        world_size = int(os.environ.get("WORLD_SIZE"))
+        if self.use_fsdp or self.use_deep_speed:
+            num_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES","").split(","))
+            local_rank = int(os.environ.get("LOCAL_RANK"))
+            rank = int(os.environ.get("RANK"))
+            world_size = int(os.environ.get("WORLD_SIZE"))
 
         print(f"I am rank: {rank} and local rank {local_rank}!")
 
