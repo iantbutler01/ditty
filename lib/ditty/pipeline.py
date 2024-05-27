@@ -168,7 +168,7 @@ class Pipeline:
 
         if self.use_fsdp or self.use_deep_speed:
             if self.use_fsdp:
-                modified_load_kwargs["low_cpu_mem_usage"] = True
+                modified_load_kwargs["low_cpu_mem_usage"] = False
 
             del modified_load_kwargs["device_map"]
             modified_load_kwargs["torch_dtype"] = torch.bfloat16 if self.use_bfloat16 else torch.float16
