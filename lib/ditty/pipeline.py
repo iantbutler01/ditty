@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 from .trainer import Trainer
 from .data import Data
+from peft import prepare_model_for_kbit_training
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -231,7 +232,6 @@ class Pipeline:
                 TaskType,
                 LoraConfig,
                 get_peft_model,
-                prepare_model_for_kbit_training,
             )
 
             peft_config = LoraConfig(
