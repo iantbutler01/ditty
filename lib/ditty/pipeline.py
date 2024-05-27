@@ -51,7 +51,8 @@ class Pipeline:
         use_qdora: bool = False,
         peft_config: bool = None,
         epochs: int = 1,
-        max_steps: Optional[int] = None
+        max_steps: Optional[int] = None,
+        use_flash_attn_2: bool = True
     ):
         self.output_dir = output_dir
         self.dataset_namespace = dataset_namespace
@@ -78,6 +79,7 @@ class Pipeline:
         self.use_deep_speed = use_deep_speed
         self.peft_config = peft_config
         self.use_qdora = use_qdora
+        self.use_flash_attn_2 = use_flash_attn_2
 
         if self.use_fsdp and self.use_deep_speed:
             raise ValueError("Cannot set both use_fsdp and use_deep_speed to True.")
@@ -176,6 +178,9 @@ class Pipeline:
 
         modified_load_kwargs = self.model_load_kwargs
 
+        if self.use_flash_attn_2:
+            modified_load_kwargs["attn_implementation"] = "flash_attention_2"
+
         if self.use_fsdp or self.use_deep_speed:
             if self.use_fsdp:
                 modified_load_kwargs["low_cpu_mem_usage"] = False
@@ -196,6 +201,9 @@ class Pipeline:
                 quantization_config=self.bnb_config,
                 **modified_load_kwargs,
             )
+
+            if self.l4bit:
+                self.model.to("cuda")
 
         target_modules = "all-linear"
 
