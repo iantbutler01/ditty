@@ -174,7 +174,7 @@ class Pipeline:
             modified_load_kwargs["torch_dtype"] = torch.bfloat16 if self.use_bfloat16 else torch.float16
 
         print("WE ARE HERE")
-        if (self.use_fsdp or self.use_deep_speed) and rank != 0:
+        if (self.use_fsdp or self.use_deep_speed) and local_rank != 0:
             with init_empty_weights():
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name_or_path,
