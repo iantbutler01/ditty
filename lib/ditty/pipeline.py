@@ -52,13 +52,14 @@ class Pipeline:
         peft_config: bool = None,
         epochs: int = 1,
         max_steps: Optional[int] = None,
-        use_flash_attn_2: bool = True
+        use_flash_attn_2: bool = True,
+        model_token: Optional[str] = True,
     ):
         self.output_dir = output_dir
         self.dataset_namespace = dataset_namespace
         self.dataset_path = dataset_path
         self.model_name_or_path = model_name_or_path
-        self.hf_hub_token = hf_hub_token
+        self.hf_hub_token = hf_hub_token or os.environ.get("HF_TOKEN")
         self.hf_hub_model_id = hf_hub_model_id
         self.fp16 = fp16
         self.seed = seed
@@ -80,6 +81,7 @@ class Pipeline:
         self.peft_config = peft_config
         self.use_qdora = use_qdora
         self.use_flash_attn_2 = use_flash_attn_2
+        self.model_token = model_token or os.environ.get("HF_TOKEN")
 
         if self.use_fsdp and self.use_deep_speed:
             raise ValueError("Cannot set both use_fsdp and use_deep_speed to True.")
@@ -148,7 +150,7 @@ class Pipeline:
         return dataloader
 
     def run(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path, token=self.model_token)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
