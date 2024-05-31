@@ -114,15 +114,12 @@ class Trainer:
         model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state)
 
     def _save(self, no_dist=False):
-        return
-
         self.accelerator.wait_for_everyone()
         self.accelerator.save_state()
         if not no_dist:
             self._save_dist()
 
     def _load_last_checkpoint(self):
-        return None
         try:
             checkpoints_dir = f"{self.output_dir}/checkpoints/"
 
