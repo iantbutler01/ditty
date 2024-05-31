@@ -40,7 +40,6 @@ class Pipeline:
         load_checkpoint: bool = True,
         checkpoint_every: int = 1000,
         gradient_checkpointing: bool = True,
-        experimental: bool = False,
         block_size: int = 2048,
         use_bfloat16: int = False,
         model_load_kwargs: Dict[str, Any] = {"device_map": "auto"},
