@@ -173,8 +173,8 @@ class Trainer:
                 logger.warning("No checkpoint found, starting from scratch.")
                 # self._save(no_dist=True)
 
-        else:
-            self._save(no_dist=True)
+        # else:
+            # self._save(no_dist=True)
 
         atexit.register(self._save)
         for ep in range(self.state.epoch, epochs):
@@ -231,7 +231,7 @@ class Trainer:
                 if max_steps is not None and batch_idx >= max_steps:
                     break
 
-                if batch_idx % self.checkpoint_every == 0:
+                if batch_idx % self.checkpoint_every == 0 and batch_idx > 0:
                     self._save()
 
             self.state.epoch += 1
