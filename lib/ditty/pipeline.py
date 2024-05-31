@@ -53,6 +53,7 @@ class Pipeline:
         max_steps: Optional[int] = None,
         use_flash_attn_2: bool = True,
         model_token: Optional[str] = True,
+        output_hub_repo: Optional[str] = None
     ):
         self.output_dir = output_dir
         self.dataset_namespace = dataset_namespace
@@ -67,6 +68,7 @@ class Pipeline:
         self.l8bit = l8bit
         self.l4bit = l4bit
         self.push_to_hub = push_to_hub
+        self.output_hub_repo = output_hub_repo
         self.batch_size = batch_size
         self.grad_accum = grad_accum
         self.block_size = block_size
@@ -87,6 +89,9 @@ class Pipeline:
 
         if self.l8bit and self.l4bit:
             raise ValueError("Cannot set both l8bit and l4bit to True.")
+
+        if self.push_to_hub and not self.output_hub_repo:
+            raise ValueError("Cannot enable push to hub without providing output_hub_repo.")
 
         if self.l4bit:
             self.bnb_config = BitsAndBytesConfig(
@@ -303,4 +308,4 @@ class Pipeline:
 
         # ## Share adapters on the 🤗 Hub
         if self.push_to_hub:
-            self.model.push_to_hub(self.output_dir, use_auth_token=True)
+            self.model.push_to_hub(self.output_hub_repo, use_auth_token=True)
