@@ -196,6 +196,9 @@ class Trainer:
                 )
 
             for batch in dataset:
+                if not batch:
+                    break
+
                 with self.accelerator.accumulate(self.model):
                     with context_manager:
                         outputs = self.model(**batch)
@@ -245,6 +248,8 @@ class Trainer:
 
                 if self.state.steps % self.checkpoint_every == 0 and self.state.steps > 0:
                     self._save()
+
+            self.accelerator.wait_for_everyone()
 
             self.state.epoch += 1
             self.state.steps = 0
