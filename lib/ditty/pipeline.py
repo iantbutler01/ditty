@@ -75,7 +75,6 @@ class Pipeline:
         self.block_size = block_size
         self.fp32_cpu_offload = fp32_cpu_offload
         self.use_bfloat16 = use_bfloat16
-        self.model_load_kwargs = model_load_kwargs
         self.accelerator_kwargs = accelerator_kwargs
         self.use_8bit_optim=use_8bit_optim
         self.use_fsdp=use_fsdp
@@ -84,7 +83,11 @@ class Pipeline:
         self.use_qdora = use_qdora
         self.use_flash_attn_2 = use_flash_attn_2
         self.model_token = model_token or os.environ.get("HF_TOKEN")
+        self.model_load_kwargs = model_load_kwargs
         self.merge_adapters = merge_adapters
+
+        if not model_load_kwargs.get("token"):
+            model_load_kwargs["token"] = self.model_token
 
         if self.use_fsdp and self.use_deep_speed:
             raise ValueError("Cannot set both use_fsdp and use_deep_speed to True.")
