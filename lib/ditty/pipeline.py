@@ -53,7 +53,8 @@ class Pipeline:
         max_steps: Optional[int] = None,
         use_flash_attn_2: bool = True,
         model_token: Optional[str] = True,
-        output_hub_repo: Optional[str] = None
+        output_hub_repo: Optional[str] = None,
+        merge_adapters: bool = True
     ):
         self.output_dir = output_dir
         self.dataset_namespace = dataset_namespace
@@ -83,6 +84,7 @@ class Pipeline:
         self.use_qdora = use_qdora
         self.use_flash_attn_2 = use_flash_attn_2
         self.model_token = model_token or os.environ.get("HF_TOKEN")
+        self.merge_adapters = merge_adapters
 
         if self.use_fsdp and self.use_deep_speed:
             raise ValueError("Cannot set both use_fsdp and use_deep_speed to True.")
@@ -309,4 +311,9 @@ class Pipeline:
 
         # ## Share adapters on the 🤗 Hub
         if self.push_to_hub and self.accelerator.is_main_process:
+            model = self.model
+
+            if self.merge_adapters and (self.l4bit or self.l8bit):
+                model = model.merge_and_unload()
+
             self.model.push_to_hub(self.output_hub_repo, token=self.hf_hub_token)
