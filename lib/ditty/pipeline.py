@@ -179,8 +179,8 @@ class Pipeline:
             "project_config": ProjectConfiguration(
                 project_dir=self.output_dir,
                 automatic_checkpoint_naming=True,
+                save_on_each_node=True
             ),
-            "save_on_each_node": True,
             "mixed_precision": "bf16" if self.use_bfloat16 else "fp16"
         } 
 
