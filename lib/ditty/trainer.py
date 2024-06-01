@@ -68,6 +68,7 @@ class Trainer:
     output_dir: str = "./output"
     checkpoint_every: int = 1000
     load_checkpoint: bool = False
+    hf_hub_token: Optional[str] = None
     seed: Optional[int] = None
 
     def __post_init__(self):
@@ -111,11 +112,11 @@ class Trainer:
     def _save_dist(self):
         model = self.accelerator.unwrap_model(self.model)
         model_state = model.state_dict()
-        model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state)
+        model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state, token=self.hf_hub_token)
 
     def _save(self, no_dist=False):
         self.accelerator.wait_for_everyone()
-        self.accelerator.save_state()
+        self.accelerator.save_state(token=self.hf_hub_token)
         if not no_dist:
             self._save_dist()
 
@@ -171,10 +172,6 @@ class Trainer:
                 logger.info(f"Checkpoint loaded: {last_cp}.")
             else:
                 logger.warning("No checkpoint found, starting from scratch.")
-                # self._save(no_dist=True)
-
-        # else:
-            # self._save(no_dist=True)
 
         atexit.register(self._save)
         for ep in range(self.state.epoch, epochs):

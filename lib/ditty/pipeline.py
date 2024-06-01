@@ -300,6 +300,7 @@ class Pipeline:
             load_checkpoint=self.load_checkpoint,
             use_bfloat16=self.use_bfloat16,
             seed=self.seed,
+            hf_hub_token=self.hf_hub_token
         )
 
         trainer.train(
@@ -308,4 +309,4 @@ class Pipeline:
 
         # ## Share adapters on the 🤗 Hub
         if self.push_to_hub:
-            self.model.push_to_hub(self.output_hub_repo, use_auth_token=True)
+            self.model.push_to_hub(self.output_hub_repo, use_auth_token=True, token=self.hf_hub_token)
