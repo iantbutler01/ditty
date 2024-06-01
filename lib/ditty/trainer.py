@@ -110,7 +110,7 @@ class Trainer:
         self.accelerator.register_for_checkpointing(self.state)
 
     def _save_dist(self):
-        if self.accelerator.is_main_process():
+        if self.accelerator.is_main_process:
             model = self.accelerator.unwrap_model(self.model)
             model_state = model.state_dict()
             model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state, token=self.hf_hub_token)
