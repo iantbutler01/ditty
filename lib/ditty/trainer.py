@@ -149,6 +149,23 @@ class Trainer:
                     self.accelerator.project_configuration.iteration = (
                         int(last_cp_num) + 1
                     )
+                    
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+                    print(self.accelerator.project_configuration)
+
+                    self.state.steps = (int(last_cp_num) + 1) * self.checkpoint_every + 1
                     return last_cp
 
         except FileNotFoundError as e:
@@ -167,6 +184,7 @@ class Trainer:
         total_batches = len(self.dataset) * epochs
         start_time = time.time()
 
+
         if self.load_checkpoint:
             last_cp = self._load_last_checkpoint()
             if last_cp:
@@ -175,6 +193,7 @@ class Trainer:
                 logger.warning("No checkpoint found, starting from scratch.")
 
         atexit.register(self._save)
+
         for ep in range(self.state.epoch, epochs):
             dataset = self.dataset
 
