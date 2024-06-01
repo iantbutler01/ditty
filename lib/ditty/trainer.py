@@ -117,7 +117,7 @@ class Trainer:
 
     def _save(self, no_dist=False):
         self.accelerator.wait_for_everyone()
-        self.accelerator.save_state(token=self.hf_hub_token)
+        self.accelerator.save_state()
         if not no_dist:
             self._save_dist()
 
