@@ -38,18 +38,21 @@ logger = getLogger()
 class TrainerState:
     epoch: int = 0
     steps: int = 0
+    total_steps: int = 0
     global_loss: int = 0
 
     def state_dict(self):
         return {
             "epoch": self.epoch,
             "steps": self.steps,
+            "total_steps": self.total_steps,
             "global_loss": self.global_loss,
         }
 
     def load_state_dict(self, state_dict):
         self.epoch = state_dict["epoch"]
         self.steps = state_dict["steps"]
+        self.total_steps = state_dict["total_steps"]
         self.global_loss = state_dict["global_loss"]
 
 
@@ -187,11 +190,12 @@ class Trainer:
             dataset = self.dataset
 
             if self.state.steps > 0:
+                logger.info(f"State steps > 0, skipping {self.state.steps} batches.")
                 dataset = self.accelerator.skip_first_batches(
                     self.dataset, self.state.steps
                 )
 
-            for batch_idx, batch in enumerate(dataset):
+            for batch in dataset:
                 with self.accelerator.accumulate(self.model):
                     with context_manager:
                         outputs = self.model(**batch)
@@ -207,7 +211,7 @@ class Trainer:
                     self.optimizer.zero_grad()
 
                     # calculate current epoch as decimal
-                    total_batches_done = ep * len(self.dataset) + batch_idx
+                    total_batches_done = ep * len(self.dataset) + self.state.steps
                     current_epoch_decimal = total_batches_done / total_batches
 
                     # calculate time elapsed and estimate remaining time
@@ -227,20 +231,23 @@ class Trainer:
                     # calculate percentage done
                     percent_done = (total_batches_done / total_batches) * 100
 
-                    print(
-                        f"Epoch {current_epoch_decimal:.2f} | Batch {batch_idx}/{len(self.dataset)} | Loss {batch_loss} | {percent_done:.2f}% done | Estimated time remaining: {estimated_time_remaining_ddhhmmss}"
+                    logger.info(
+                        f"Epoch {current_epoch_decimal:.2f} | Batch {self.state.steps}/{len(self.dataset)} | Loss {batch_loss} | {percent_done:.2f}% done | Estimated time remaining: {estimated_time_remaining_ddhhmmss}"
                     )
 
                     self.state.global_loss += batch_loss
 
                 self.state.steps += 1
-                if max_steps is not None and batch_idx >= max_steps:
+                self.state.total_steps += 1
+
+                if max_steps is not None and self.state.steps >= max_steps:
                     break
 
-                if batch_idx % self.checkpoint_every == 0 and batch_idx > 0:
+                if self.state.steps % self.checkpoint_every == 0 and self.state.steps > 0:
                     self._save()
 
             self.state.epoch += 1
+            self.state.steps = 0
         atexit.unregister(self._save)
         self._save()
 
