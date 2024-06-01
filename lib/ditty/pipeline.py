@@ -308,5 +308,5 @@ class Pipeline:
         )
 
         # ## Share adapters on the 🤗 Hub
-        if self.push_to_hub:
+        if self.push_to_hub and self.accelerator.is_main_process():
             self.model.push_to_hub(self.output_hub_repo, use_auth_token=True, token=self.hf_hub_token)
