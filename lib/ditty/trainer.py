@@ -190,7 +190,7 @@ class Trainer:
             dataset = self.dataset
 
             if self.state.steps > 0:
-                logger.info(f"State steps > 0, skipping {self.state.steps} batches.")
+                logger.info(f"State steps > 0, current batch: {self.state.steps}, skipping {self.state.steps - 1} batches.")
                 dataset = self.accelerator.skip_first_batches(
                     self.dataset, self.state.steps
                 )
