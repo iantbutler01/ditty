@@ -150,22 +150,7 @@ class Trainer:
                         int(last_cp_num) + 1
                     )
                     
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-                    print(self.accelerator.project_configuration)
-
-                    self.state.steps = (int(last_cp_num) + 1) * self.checkpoint_every + 1
+                    # self.state.steps = (int(last_cp_num) + 1) * self.checkpoint_every + 1
                     return last_cp
 
         except FileNotFoundError as e:
@@ -191,6 +176,10 @@ class Trainer:
                 logger.info(f"Checkpoint loaded: {last_cp}.")
             else:
                 logger.warning("No checkpoint found, starting from scratch.")
+
+        print(self.state)
+        print(self.state)
+        print(self.state)
 
         atexit.register(self._save)
 
