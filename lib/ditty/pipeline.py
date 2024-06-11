@@ -4,8 +4,10 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
-from typing import Optional, List, Dict, Any
 import os
+import functools
+import types
+from typing import Optional, List, Dict, Any
 import bitsandbytes as bnb
 from accelerate import Accelerator, infer_auto_device_map, init_empty_weights
 from accelerate.utils import ProjectConfiguration
@@ -14,7 +16,10 @@ import torch
 from torch.utils.data import DataLoader
 from .trainer import Trainer
 from .data import Data
-from peft import prepare_model_for_kbit_training
+from peft import prepare_model_for_kbit_training 
+from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LLAMA_ATTENTION_CLASSES, LlamaMLP
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer, MISTRAL_ATTENTION_CLASSES, MistralMLP
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -103,6 +108,7 @@ class Pipeline:
                 load_in_4bit=True,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
+                bnb_4bit_quant_storage=torch.bfloat16,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
         elif self.l8bit:
@@ -157,9 +163,49 @@ class Pipeline:
             ]
         )
         return dataloader
+    
+    # All credit for this wrapping policy code goes to AnswerAI, specifically from https://github.com/AnswerDotAI/fsdp_qlora/blob/ed431272fd95b8ff57b5b12aff0f0cbdbd29cf96/train.py#L444C1-L479C60
+    # released under Apache V2 and slightly modified to support the goals here in the Ditty library.
+    def _get_wrapping_policy(self, custom_policy:bool=False, vanilla_policy:bool=False):
+        from peft.tuners import PromptEncoder, PromptEmbedding, PrefixEncoder
+
+        # if custom_policy:
+        #     def lambda_policy_fn(module):
+        #         # LoRA and DoRA trainable layers.
+        #         return (isinstance(module, nn.Sequential) and all(m.weight.requires_grad for m in module)) or (isinstance(module, (DORALayer, MagnitudeLayer)))
+        # else:
+        def lambda_policy_fn(module):
+            return (
+                len(list(module.named_children())) == 0
+                and getattr(module, "weight", None) is not None
+                and module.weight.requires_grad
+            )
+
+        def self_attn_policy_fn(module):
+            # Check module name is self_attn.
+            return isinstance(module, tuple((*LLAMA_ATTENTION_CLASSES.values(), *MISTRAL_ATTENTION_CLASSES.values())))
+
+        def mlp_policy_fn(module):
+            # Check module name is self_attn.
+            return isinstance(module, (LlamaMLP, MistralMLP))
+
+        lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+        self_attn_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=self_attn_policy_fn)
+        mlp_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=mlp_policy_fn)
+        transformer_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=(LlamaDecoderLayer, MistralDecoderLayer),
+        )
+        if vanilla_policy:
+            return transformer_wrap_policy
+
+        policies=[lambda_policy, transformer_wrap_policy]
+        if custom_policy:
+            policies.extend([self_attn_policy, mlp_policy])
+        return functools.partial(_or_policy, policies=policies)
 
     def run(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path, token=self.model_token)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name_or_path, token=self.model_token, torch_dtype=torch.bfloat16)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
@@ -181,12 +227,14 @@ class Pipeline:
                 automatic_checkpoint_naming=True,
                 save_on_each_node=True
             ),
-            "mixed_precision": "bf16" if self.use_bfloat16 else "fp16"
+            # "mixed_precision": "bf16" if self.use_bfloat16 else "fp16"
+            "mixed_precision": "no"
         } 
 
         acc_kwargs = {**acc_kwargs, **self.accelerator_kwargs}
 
         self.accelerator = Accelerator(**acc_kwargs)
+
 
         modified_load_kwargs = self.model_load_kwargs
 
@@ -195,7 +243,12 @@ class Pipeline:
 
         if self.use_fsdp or self.use_deep_speed:
             if self.use_fsdp:
-                modified_load_kwargs["low_cpu_mem_usage"] = False
+                modified_load_kwargs["low_cpu_mem_usage"] = True
+                my_auto_wrap_policy = self._get_wrapping_policy(custom_policy=False, vanilla_policy=(not self.l8bit and not self.l4bit))
+
+                self.accelerator.state.fsdp_plugin.auto_wrap_policy = my_auto_wrap_policy
+
+                print(self.accelerator.state.fsdp_plugin.limit_all_gathers)
 
             del modified_load_kwargs["device_map"]
             modified_load_kwargs["torch_dtype"] = torch.bfloat16 if self.use_bfloat16 else torch.float16
@@ -214,7 +267,7 @@ class Pipeline:
                 **modified_load_kwargs,
             )
 
-        target_modules = "all-linear"
+        target_modules = ["k_proj", "q_proj", "v_proj", "up_proj", "down_proj", "gate_proj"]
 
         print(self.model)
 
@@ -224,8 +277,7 @@ class Pipeline:
         if "rwkv" in self.model_name_or_path:
             target_modules = ["key", "value", "receptance", "xxx"]
 
-
-        if self.l8bit or self.l4bit:
+        if self.l8bit or self.l4bit and not self.use_fsdp:
             self.model = prepare_model_for_kbit_training(
                 self.model, use_gradient_checkpointing=self.gradient_checkpointing
             )
@@ -252,25 +304,53 @@ class Pipeline:
                 get_peft_model,
             )
 
+            from bitsandbytes.nn import Linear4bit, Params4bit
+
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 target_modules=target_modules,
                 inference_mode=False,
                 r=8,
                 lora_alpha=16,
-                lora_dropout=0.05,
+                lora_dropout=0.1,
                 bias="none",
                 use_dora=self.use_qdora
             )
 
+            self.model.enable_input_require_grads()
+
+
+            # Credit for this method goes to AnswerAI, specifically https://github.com/AnswerDotAI/fsdp_qlora/blob/ed431272fd95b8ff57b5b12aff0f0cbdbd29cf96/train.py#L164
+            def setup_quantized_meta_for_peft(model: torch.nn.Module):
+                """Replaces `quant_state.to` with a dummy function to prevent PEFT from moving `quant_state` to meta device"""
+                def temp_to_method(self, *args, **kwargs):
+                    return self
+                for param in model.parameters():
+                    if isinstance(param, Params4bit):
+                        param.quant_state._orig_to = param.quant_state.to
+                        param.quant_state.to = types.MethodType(temp_to_method, param.quant_state)
+
+            # Credit for this method goes to AnswerAI, specifically https://github.com/AnswerDotAI/fsdp_qlora/blob/ed431272fd95b8ff57b5b12aff0f0cbdbd29cf96/train.py#L173 
+            def setup_quantized_peft_meta_for_training(model: torch.nn.Module):
+                """Replaces dummy `quant_state.to` method with the original function to allow training to continue"""
+                for param in model.parameters():
+                    if isinstance(param, Params4bit) and hasattr(param.quant_state, '_orig_to'):
+                        param.quant_state.to = param.quant_state._orig_to
+                        param.quant_state._orig_to = None
+
+            setup_quantized_meta_for_peft(self.model)
+
             self.model = get_peft_model(self.model, peft_config)
 
+            setup_quantized_peft_meta_for_training(self.model)
+
+        print("FINISHED LOADING MODEL")
         ### Training
         if self.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
         self.model.config.use_cache = (
-            False  # silence the warnings. Please re-enable for inference!
+            not self.gradient_checkpointing
         )
 
         adam_beta1 = 0.9
