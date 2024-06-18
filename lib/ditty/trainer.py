@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import set_seed
 from transformers.trainer_pt_utils import (
     get_model_param_count,
 )
@@ -13,15 +13,11 @@ import atexit
 
 
 import numpy as np
-import random
 import contextlib
 
-from peft import PeftModelForCausalLM
 from logging import getLogger
 from typing import Optional
 import os
-
-from transformers import PreTrainedModel
 
 
 def default_scheduler_factory(optimizer):
@@ -35,25 +31,28 @@ def get_number_from_checkpoint(filename):
     return int(parts[1])
 
 
-logger = getLogger()
+logger = getLogger("ditty_training")
 
 
 @dataclass(kw_only=True)
 class TrainerState:
     epoch: int = 0
     steps: int = 0
+    total_steps: int = 0
     global_loss: int = 0
 
     def state_dict(self):
         return {
             "epoch": self.epoch,
             "steps": self.steps,
+            "total_steps": self.total_steps,
             "global_loss": self.global_loss,
         }
 
     def load_state_dict(self, state_dict):
         self.epoch = state_dict["epoch"]
         self.steps = state_dict["steps"]
+        self.total_steps = state_dict["total_steps"]
         self.global_loss = state_dict["global_loss"]
 
 
@@ -61,17 +60,18 @@ class TrainerState:
 class Trainer:
     model: nn.Module
     optimizer: torch.optim.Optimizer
+    accelerator: Accelerator
     dataset: DataLoader
     device: torch.device
     scheduler: torch.optim.lr_scheduler._LRScheduler | None = None
     use_scheduler: bool = True
     grad_accum: int = 1
-    accelerator_kwargs: dict = field(default_factory=dict)
     fp16: bool = False
     use_bfloat16: bool = False
     output_dir: str = "./output"
     checkpoint_every: int = 1000
     load_checkpoint: bool = False
+    hf_hub_token: Optional[str] = None
     seed: Optional[int] = None
 
     def __post_init__(self):
@@ -90,18 +90,6 @@ class Trainer:
         elif self.fp16:
             self.f16_dtype = torch.float16
 
-        acc_kwargs = {
-            "gradient_accumulation_steps": self.grad_accum,
-            "project_dir": self.output_dir,
-            "project_config": ProjectConfiguration(
-                project_dir=self.output_dir,
-                automatic_checkpoint_naming=True,
-            ),
-        }
-
-        acc_kwargs = {**acc_kwargs, **self.accelerator_kwargs}
-
-        self.accelerator = Accelerator(**acc_kwargs)
         device = self.accelerator.device
         self.device = device
 
@@ -125,13 +113,28 @@ class Trainer:
         self.accelerator.register_for_checkpointing(self.state)
 
     def _save_dist(self):
-        model = self.accelerator.unwrap_model(self.model)
-        model_state = model.state_dict()
-        model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state)
+        if(self.accelerator.is_main_process):
+            logger.info("Saving full model distribution.")
+
+        if not self.accelerator.distributed_type == "FSDP":
+            model = self.accelerator.unwrap_model(self.model)
+            model_state = model.state_dict()
+            model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state, token=self.hf_hub_token)
+        else:
+            model = self.accelerator.unwrap_model(self.model)
+
+            model.save_pretrained(
+                f"{self.output_dir}/dist",
+                is_main_process=self.accelerator.is_main_process,
+                save_function=self.accelerator.save,
+                state_dict=self.accelerator.get_state_dict(model),
+                token=self.hf_hub_token
+            )
 
     def _save(self, no_dist=False):
         self.accelerator.wait_for_everyone()
         self.accelerator.save_state()
+
         if not no_dist:
             self._save_dist()
 
@@ -163,6 +166,8 @@ class Trainer:
                     self.accelerator.project_configuration.iteration = (
                         int(last_cp_num) + 1
                     )
+                    
+                    # self.state.steps = (int(last_cp_num) + 1) * self.checkpoint_every + 1
                     return last_cp
 
         except FileNotFoundError as e:
@@ -187,21 +192,22 @@ class Trainer:
                 logger.info(f"Checkpoint loaded: {last_cp}.")
             else:
                 logger.warning("No checkpoint found, starting from scratch.")
-                self._save(no_dist=True)
-
-        else:
-            self._save(no_dist=True)
 
         atexit.register(self._save)
+
         for ep in range(self.state.epoch, epochs):
             dataset = self.dataset
 
             if self.state.steps > 0:
+                logger.info(f"State steps > 0, current batch: {self.state.steps}, skipping {self.state.steps - 1} batches.")
                 dataset = self.accelerator.skip_first_batches(
                     self.dataset, self.state.steps
                 )
 
-            for batch_idx, batch in enumerate(dataset):
+            for batch in dataset:
+                if not batch:
+                    break
+
                 with self.accelerator.accumulate(self.model):
                     with context_manager:
                         outputs = self.model(**batch)
@@ -217,7 +223,7 @@ class Trainer:
                     self.optimizer.zero_grad()
 
                     # calculate current epoch as decimal
-                    total_batches_done = ep * len(self.dataset) + batch_idx
+                    total_batches_done = ep * len(self.dataset) + self.state.steps
                     current_epoch_decimal = total_batches_done / total_batches
 
                     # calculate time elapsed and estimate remaining time
@@ -237,24 +243,30 @@ class Trainer:
                     # calculate percentage done
                     percent_done = (total_batches_done / total_batches) * 100
 
-                    print(
-                        f"Epoch {current_epoch_decimal:.2f} | Batch {batch_idx}/{len(self.dataset)} | Loss {batch_loss} | {percent_done:.2f}% done | Estimated time remaining: {estimated_time_remaining_ddhhmmss}"
+                    logger.info(
+                        f"Epoch {current_epoch_decimal:.2f} | Batch {self.state.steps}/{len(self.dataset)} | Loss {batch_loss} | {percent_done:.2f}% done | Estimated time remaining: {estimated_time_remaining_ddhhmmss}"
                     )
 
                     self.state.global_loss += batch_loss
+                    outputs = None
 
                 self.state.steps += 1
-                if max_steps is not None and batch_idx >= max_steps:
+                self.state.total_steps += 1
+
+                if max_steps is not None and self.state.steps >= max_steps:
                     break
 
-                if batch_idx % self.checkpoint_every == 0:
+                if self.state.steps % self.checkpoint_every == 0 and self.state.steps > 0:
                     self._save()
 
+            self.accelerator.wait_for_everyone()
+
             self.state.epoch += 1
+            self.state.steps = 0
         atexit.unregister(self._save)
         self._save()
 
-        return self.state.global_loss / self.state.steps
+        return self.state.global_loss / self.state.total_steps
 
     def train(self, epochs=1, max_steps=None):
         logger.info("***** Running training *****")
