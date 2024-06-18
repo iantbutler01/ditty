@@ -31,7 +31,7 @@ def get_number_from_checkpoint(filename):
     return int(parts[1])
 
 
-logger = getLogger()
+logger = getLogger("ditty_training")
 
 
 @dataclass(kw_only=True)
@@ -113,14 +113,28 @@ class Trainer:
         self.accelerator.register_for_checkpointing(self.state)
 
     def _save_dist(self):
-        if self.accelerator.is_main_process:
+        if(self.accelerator.is_main_process):
+            logger.info("Saving full model distribution.")
+
+        if not self.accelerator.distributed_type == "FSDP":
             model = self.accelerator.unwrap_model(self.model)
             model_state = model.state_dict()
             model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state, token=self.hf_hub_token)
+        else:
+            model = self.accelerator.unwrap_model(self.model)
+
+            model.save_pretrained(
+                f"{self.output_dir}/dist",
+                is_main_process=self.accelerator.is_main_process,
+                save_function=self.accelerator.save,
+                state_dict=self.accelerator.get_state_dict(model),
+                token=self.hf_hub_token
+            )
 
     def _save(self, no_dist=False):
         self.accelerator.wait_for_everyone()
         self.accelerator.save_state()
+
         if not no_dist:
             self._save_dist()
 
@@ -172,17 +186,12 @@ class Trainer:
         total_batches = len(self.dataset) * epochs
         start_time = time.time()
 
-
         if self.load_checkpoint:
             last_cp = self._load_last_checkpoint()
             if last_cp:
                 logger.info(f"Checkpoint loaded: {last_cp}.")
             else:
                 logger.warning("No checkpoint found, starting from scratch.")
-
-        print(self.state)
-        print(self.state)
-        print(self.state)
 
         atexit.register(self._save)
 
@@ -239,6 +248,7 @@ class Trainer:
                     )
 
                     self.state.global_loss += batch_loss
+                    outputs = None
 
                 self.state.steps += 1
                 self.state.total_steps += 1
@@ -256,7 +266,7 @@ class Trainer:
         atexit.unregister(self._save)
         self._save()
 
-        return self.state.global_loss / self.state.steps
+        return self.state.global_loss / self.state.total_steps
 
     def train(self, epochs=1, max_steps=None):
         logger.info("***** Running training *****")

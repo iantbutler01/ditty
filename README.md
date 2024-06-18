@@ -2,27 +2,26 @@
 
 A simple fine-tune.
 
+## Who
+
+Ditty powers finetuning the models at [BismuthOS](https://www.bismuthos.com) an AI enabled cloud platform. Build faster, Launch instantly. This library, like much work at Bismuth is part of our commitment to Open Source and contributing back to the communities we participate in.
+
 ## What
-A very simple library for finetuning Huggingface Pretrained AutoModelForCausalLM such as GPTNeoX, leveraging Huggingface Accelerate, Transformers, Datasets and Peft
+A very simple library for finetuning Huggingface Pretrained AutoModelForCausalLM such as GPTNeoX, Llama3, Mistral, etc. leveraging Huggingface Accelerate, Transformers, Datasets and Peft
 
 Ditty has support for LORA, 8bit, and fp32 cpu offloading right out of the box and assumes you are running with a single GPU or distributed over multiple GPUs by default.
 
-Checkpointing supported, currently a bug with pushing to HF model hub though so checkpoints are all local.
+Checkpointing supported.
 
-FP16, BFLOAT16 now supported.
+We now also support FSDP, QLORA, FSDP + QLORA and DeepSpeed Z3! This has been tested on a 3 node cluster with 9 gpus.
 
-QLORA 4bit supported under experimental, and requires installing development branches of accelerate, peft, transformers and the latest bitsandbytes.
-
+FP16, BFLOAT16 supported.
 
 ## What Not
 - Ditty does not support ASICs like TPU or Trainium.
 - Ditty does not handle Sagemaker
-- Ditty does not by default run with the CPU
+- Ditty does not by default run with the CPU, except in cases where offloading is enabled (FSDP, DeepSpeed)
 - Ditty does not handle evaluation sets or benchmarking, this may or may not change.
-
-## Soon
-- Ditty may handle distributed cluster finetuning
-- Ditty will support DeepSpeed
 
 ## Classes
 
@@ -81,9 +80,22 @@ It can be combined with Pipeline to make a very quick cli for launching your pro
 
 ## Attribution / Statement of Changes
 
+### Huggingface
+
 Portions of this library look to Huggingface's transformers Trainer class as a reference and in some cases re-implements functions from Trainer, simplified to only account for GPU based work and overall narrower supported scope.
 
 This statement is both to fulfill the obligations of the ApacheV2 licencse, but also because those folks do super cool work and I appreciate all they've done for the community and its just right to call this out.
+
+Portions of this library modify Huggingface's hub code to support properly saving FSDP sharded models, for this code the appropriate license is reproduced in file and modifications are stated.
+
+### Answer.ai
+
+Portions of this library implement Answer.ai's method of quantizing and loading model layers + placing them on device manually as well as wrapping code for FSDP. 
+
+Thanks so much for the Answer.ai team, without their work it would have been significantly harder to implement FSDP+QLORA in Ditty
+
+Our implementation is basically a complete reproduction with slight changes to make it work with Ditty nuances, the original work can be found here, it is really good work and you should check it out:
+https://github.com/AnswerDotAI/fsdp_qlora
 
 ## License
 
