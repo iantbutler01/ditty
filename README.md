@@ -9,13 +9,20 @@ Ditty powers finetuning the models at [BismuthOS](https://www.bismuthos.com) an 
 ## What
 A very simple library for finetuning Huggingface Pretrained AutoModelForCausalLM such as GPTNeoX, Llama3, Mistral, etc. leveraging Huggingface Accelerate, Transformers, Datasets and Peft
 
-Ditty has support for LORA, 8bit, and fp32 cpu offloading right out of the box and assumes you are running with a single GPU or distributed over multiple GPUs by default.
+Ditty has support for:
+- LORA, QLORA
+- 8bit, 4bit
+- FP16, BFLOAT16
+- 8bit Adam
+- fp32 cpu offloading
+- FSDP, FSDP + QLORA
+- DeepSpeed
+- Checkpointing
+- Pushing to the hub
 
-Checkpointing supported.
+right out of the box and assumes you are running with a single GPU or distributed over multiple GPUs by default.
 
-We now also support FSDP, QLORA, FSDP + QLORA and DeepSpeed Z3! This has been tested on a 3 node cluster with 9 gpus.
-
-FP16, BFLOAT16 supported.
+This has been tested on a 3 node cluster with 9 gpus.
 
 ## What Not
 - Ditty does not support ASICs like TPU or Trainium.
