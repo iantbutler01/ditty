@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ditty"
-version = "0.6.0"
+version = "0.7.0"
 description = "Distributed training library with FSDP2, pipeline contracts, and modern optimizers"
 readme = "README.md"
 license = "Apache-2.0"
@@ -36,6 +36,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "transformers>=4.52.4",
     "bitsandbytes",
+    "torchao",
 ]
 
 [project.optional-dependencies]
