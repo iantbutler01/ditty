@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ditty"
+version = "0.6.0"
+description = "Distributed training library with FSDP2, pipeline contracts, and modern optimizers"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "Ian T Butler (KinglyCrow)", email = "iantbutler01@gmail.com" }
+]
+keywords = ["finetuning", "llm", "nlp", "machine learning", "distributed training", "fsdp2"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate",
+    "datasets>=3.2.0",
+    "einops>=0.8.0",
+    "fastcore",
+    "huggingface-hub>=0.33.0",
+    "numpy>=2.2.1",
+    "peft",
+    "safetensors>=0.5.3",
+    "torch>=2.5.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.52.4",
+    "bitsandbytes",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/iantbutler01/ditty"
+Repository = "https://github.com/iantbutler01/ditty"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lib/ditty"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

@@ -12,7 +12,7 @@ A very simple library for finetuning Huggingface Pretrained AutoModelForCausalLM
 Ditty has support for:
 - LORA, QLORA
 - 8bit, 4bit
-- FP16, BFLOAT16
+- FP16, BFLOAT16, FP8 (via transformer-engine)
 - 8bit Adam
 - fp32 cpu offloading
 - FSDP, FSDP + QLORA
@@ -20,7 +20,17 @@ Ditty has support for:
 - Checkpointing
 - Pushing to the hub
 
-right out of the box and assumes you are running with a single GPU or distributed over multiple GPUs by default.
+### FP8 Training
+
+FP8 training is supported via [NVIDIA Transformer Engine](https://github.com/NVIDIA/TransformerEngine). This provides compute speedups on supported GPUs (H100, Ada Lovelace) by running matmuls in 8-bit floating point.
+
+To use FP8:
+1. Install transformer-engine: `pip install transformer-engine[pytorch]`
+2. Pass `accelerator_kwargs={"mixed_precision": "fp8"}` to Pipeline
+
+Note: FP8 primarily benefits transformer-based models where TransformerEngine can replace attention and linear layers. CNNs and other architectures may see limited benefit.
+
+All other features work right out of the box and assumes you are running with a single GPU or distributed over multiple GPUs by default.
 
 This has been tested on a 3 node cluster with 9 gpus.
 
@@ -30,47 +40,145 @@ This has been tested on a 3 node cluster with 9 gpus.
 - Ditty does not by default run with the CPU, except in cases where offloading is enabled (FSDP, DeepSpeed)
 - Ditty does not handle evaluation sets or benchmarking, this may or may not change.
 
+## Architecture
+
+Ditty uses a pipeline pattern for training:
+
+```
+batch -> preprocessors -> model.forward -> postprocessors -> loss_calculator
+```
+
+This allows flexible composition of training workflows without modifying the core trainer.
+
 ## Classes
 
 ### Pipeline
 
-Pipeline is responsible for running the entire show. Simply subclass Pipeline and implement the `dataset` method for your custom data, this must return a `torch.utils.data.DataLoader`
+The main entry point. Pass a `ModelFactory`, `DataLoader`, `LossCalculator`, and optional pre/post processors:
 
-Instantiate with your chosen config and then simply call `run`.
+```python
+from ditty import Pipeline, ModelFactory, CompositeLoss
+
+model_factory = ModelFactory.from_instance(my_model)
+# or: ModelFactory.from_checkpoint(path, model_class, **kwargs)
+
+pipeline = Pipeline(
+    model_factory=model_factory,
+    dataloader=my_dataloader,
+    loss_calculator=my_loss,
+    preprocessors=[...],
+    postprocessors=[...],
+    output_dir="./output",
+    bf16=True,
+    use_8bit_optim=True,
+    lr=2e-4,
+    epochs=10,
+)
+pipeline.run()
+```
+
+### ModelFactory
+
+Handles model creation and checkpoint loading:
+
+- `ModelFactory.from_instance(model)` - Wrap an existing model instance
+- `ModelFactory.from_checkpoint(path, model_class, **kwargs)` - Load from checkpoint
+
+### PreProcessor / PostProcessor
+
+Transform data before the model or outputs after:
+
+```python
+from ditty.processors import PreProcessor, PostProcessor, Context
+
+class MyPreProcessor(PreProcessor):
+    def __init__(self):
+        super().__init__(contract="batch:3:i64 -> batch:3:i64 | ctx.my_key:0:i64")
+
+    def process(self, batch, ctx: Context):
+        # Add data to forward_kwargs for the model
+        ctx["forward_kwargs"] = ctx.get("forward_kwargs", {})
+        ctx["forward_kwargs"]["my_param"] = some_value
+        return batch, ctx
+
+class MyPostProcessor(PostProcessor):
+    def process(self, model_output, ctx: Context):
+        # Extract targets for loss computation
+        ctx["target"] = extract_target(model_output, ctx["original_batch"])
+        return model_output, ctx
+```
+
+### LossCalculator
+
+Compute loss from model outputs. Use `output_index` to select from tuple outputs:
+
+```python
+from ditty.loss import LossCalculator, LossOutput, CompositeLoss
+
+class MyLoss(LossCalculator):
+    def __init__(self):
+        super().__init__(output_index=0, target_key="target", mask_key="mask")
+
+    def compute(self, model_output, ctx) -> LossOutput:
+        pred = self.get_prediction(model_output)  # model_output[output_index]
+        target = self.get_target(ctx)             # ctx[target_key]
+        mask = self.get_mask(ctx)                 # ctx[mask_key] or None
+        loss = F.mse_loss(pred, target)
+        return LossOutput(loss=loss, metrics={"mse": loss.item()})
+
+# Combine multiple losses with weights
+loss_calculator = CompositeLoss([
+    (MSELoss(output_index=0), 1.0),
+    (CrossEntropyLoss(output_index=1), 0.1),
+])
+```
 
 ### Trainer
 
-Trainer does what it's name implies, which is to train the model. You may never need to touch this if you're not interested in customizing the training loop.
+Handles the training loop. You typically don't interact with this directly - Pipeline creates it internally.
 
 ### Data
 
-Data wraps an HF Dataset and can configure length grouped sampling and random sampling, as well as handling collation, batching, seeds, removing unused columns and a few other things.
+Wraps HF Datasets with preprocessing support:
 
-The primary way of using this class is through the `prepare` method which takes a list of operations to perform against the dataset. These are normal operations like `map` and `filter`.
-
-Example:
 ```python
 data = Data(
-    load_kwargs={"path": self.dataset_name, "name":
-                 self.dataset_language},
-    tokenizer=self.tokenizer,
-    seed=self.seed,
-    batch_size=self.batch_size,
-    grad_accum=self.grad_accum,
+    load_kwargs={"path": "dataset_name"},
+    tokenizer=tokenizer,
+    batch_size=8,
 )
 
-....sic
-
-dataloader = data.prepare(
-        [
-            ("filter", filter_longer, {}),
-            ("map", do_something, dict(batched=True, remove_columns=columns)), 
-            ("map", truncate, {}),
-        ]
-    )
+dataloader = data.prepare([
+    ("filter", filter_fn, {}),
+    ("map", transform_fn, {"batched": True}),
+])
 ```
 
-This can be used to great effect when overriding the `dataset` method in a subclass of `Pipeline`.
+## Diffusion Support
+
+Ditty includes utilities for diffusion model training:
+
+```python
+from ditty.diffusion import Scheduler
+
+scheduler = Scheduler(
+    max_timesteps=1000,
+    schedule_type="cosine",  # or "linear"
+    beta_start=0.0001,
+    beta_end=0.02,
+)
+```
+
+## Contracts (Optional)
+
+Processors and losses can declare contracts for validation:
+
+```python
+# Terse syntax: "input_shape -> output_shape | ctx.key:shape:dtype"
+contract = "batch:3:i64 -> batch:3:i64 | ctx.t:1:i64"
+```
+
+Pipeline validates that contracts chain together correctly at initialization.
 
 ## Setup
 
