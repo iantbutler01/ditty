@@ -80,6 +80,8 @@ class ModelFactory:
         load_kwargs: Optional[Dict[str, Any]] = None,
         contract: str = "",
         model_transform: Optional[ModelTransform] = None,
+        use_compile: bool = False,
+        compile_mode: str = "default",
     ):
         self._model = model
         self._model_path = model_path
@@ -87,6 +89,10 @@ class ModelFactory:
         self._load_kwargs = load_kwargs or {}
         self.contract = contract
         self._model_transform = model_transform
+        self.use_compile = use_compile
+        self.compile_mode = compile_mode
+        # Injected by Pipeline when resuming from checkpoint
+        self._checkpoint_state: Optional[Dict[str, Any]] = None
 
         if isinstance(fsdp_config, dict):
             self.fsdp_config = FSDPConfig(**fsdp_config)
@@ -131,6 +137,8 @@ class ModelFactory:
         model_class: Type[nn.Module],
         fsdp_config: Optional[Union[FSDPConfig, Dict[str, Any]]] = None,
         model_transform: Optional[ModelTransform] = None,
+        use_compile: bool = False,
+        compile_mode: str = "default",
         **model_kwargs,
     ) -> "ModelFactory":
         return cls(
@@ -139,6 +147,8 @@ class ModelFactory:
             fsdp_config=fsdp_config,
             load_kwargs=model_kwargs,
             model_transform=model_transform,
+            use_compile=use_compile,
+            compile_mode=compile_mode,
         )
 
     @classmethod
@@ -146,8 +156,15 @@ class ModelFactory:
         cls,
         model: nn.Module,
         fsdp_config: Optional[Union[FSDPConfig, Dict[str, Any]]] = None,
+        use_compile: bool = False,
+        compile_mode: str = "default",
     ) -> "ModelFactory":
-        return cls(model=model, fsdp_config=fsdp_config)
+        return cls(
+            model=model,
+            fsdp_config=fsdp_config,
+            use_compile=use_compile,
+            compile_mode=compile_mode,
+        )
 
     def _replace_linear(self, model: nn.Module, skip_modules: List[str] = None):
         skip_modules = skip_modules or ["lm_head"]
@@ -266,7 +283,12 @@ class ModelFactory:
 
     def _load_model(self) -> nn.Module:
         if self._model is not None:
-            return self._model
+            model = self._model
+            # Apply checkpoint state if injected (for resuming training)
+            if self._checkpoint_state is not None:
+                logger.info("Loading model weights from checkpoint state")
+                model.load_state_dict(self._checkpoint_state)
+            return model
 
         if self.quant_config.enabled and self.quant_config.bits == 4 and self.fsdp_config.enabled:
             logger.info(f"Loading 4bit quantized model: {self._model_path}")
@@ -293,14 +315,28 @@ class ModelFactory:
                 **self._load_kwargs,
             )
 
-        if self._model_path.endswith(".pt") or self._model_path.endswith(".pth"):
-            logger.info(f"Loading model from checkpoint: {self._model_path}")
-            state_dict = torch.load(self._model_path, map_location="cpu", weights_only=False)
-            if "model_state_dict" in state_dict:
-                state_dict = state_dict["model_state_dict"]
-            model = self._model_class(**self._load_kwargs)
-            model.load_state_dict(state_dict)
-            return model
+        # For custom model classes, create model then optionally load checkpoint
+        if self._model_path is None or self._model_path.endswith(".pt") or self._model_path.endswith(".pth"):
+            # Determine which state dict to use
+            if self._checkpoint_state is not None:
+                # Use injected checkpoint state (from Pipeline resume)
+                logger.info("Loading model weights from checkpoint state")
+                model = self._model_class(**self._load_kwargs)
+                model.load_state_dict(self._checkpoint_state)
+                return model
+            elif self._model_path is not None:
+                # Load from explicit checkpoint path
+                logger.info(f"Loading model from checkpoint: {self._model_path}")
+                state_dict = torch.load(self._model_path, map_location="cpu", weights_only=False)
+                if "model_state_dict" in state_dict:
+                    state_dict = state_dict["model_state_dict"]
+                model = self._model_class(**self._load_kwargs)
+                model.load_state_dict(state_dict)
+                return model
+            else:
+                # Fresh model, no weights to load
+                model = self._model_class(**self._load_kwargs)
+                return model
 
         raise ValueError(f"Cannot load model from {self._model_path}")
 
@@ -385,6 +421,10 @@ class ModelFactory:
 
         if self.peft_config.enabled:
             model = self._apply_peft(model)
+
+        if self.use_compile:
+            logger.info(f"Compiling model with torch.compile(mode={self.compile_mode})")
+            model = torch.compile(model, mode=self.compile_mode)
 
         if not self.fsdp_config.enabled:
             logger.info("FSDP disabled, returning unwrapped model")

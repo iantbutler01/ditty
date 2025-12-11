@@ -3,6 +3,7 @@ import time
 from .utils import convert_seconds_to_string_time
 from .loss import LossCalculator, MSELoss, LossOutput
 from .processors import PreProcessor, PostProcessor, Context
+from .checkpoint import CheckpointManager
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -18,13 +19,6 @@ import os
 
 def default_scheduler_factory(optimizer):
     return torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-
-
-def get_number_from_checkpoint(filename: str) -> Optional[int]:
-    parts = filename.split("_")
-    if len(parts) != 2 or not parts[1].isdigit():
-        return None
-    return int(parts[1])
 
 
 logger = getLogger("ditty_training")
@@ -46,10 +40,10 @@ class TrainerState:
         }
 
     def load_state_dict(self, state_dict):
-        self.epoch = state_dict["epoch"]
-        self.steps = state_dict["steps"]
-        self.total_steps = state_dict["total_steps"]
-        self.global_loss = state_dict["global_loss"]
+        self.epoch = state_dict.get("epoch", 0)
+        self.steps = state_dict.get("steps", 0)
+        self.total_steps = state_dict.get("total_steps", 0)
+        self.global_loss = state_dict.get("global_loss", 0.0)
 
 
 @dataclass(kw_only=True)
@@ -77,7 +71,6 @@ class Trainer:
     use_bfloat16: bool = False
     output_dir: str = "./output"
     checkpoint_every: int = 1000
-    load_checkpoint: bool = False
     hf_hub_token: Optional[str] = None
     seed: Optional[int] = None
     metrics_logger: Optional[Any] = None
@@ -86,6 +79,9 @@ class Trainer:
     shuffle_each_epoch: bool = True
     total_batches: Optional[int] = None
     is_fsdp: bool = False
+
+    # Pre-loaded state (from CheckpointManager, loaded before Trainer creation)
+    initial_state: Optional[TrainerState] = None
 
     def __post_init__(self):
         if self.seed:
@@ -113,7 +109,6 @@ class Trainer:
                 self.optimizer, self.dataset, self.scheduler = self.accelerator.prepare(
                     self.optimizer, self.dataset, self.scheduler
                 )
-                self.accelerator.register_for_checkpointing(self.scheduler)
             else:
                 self.optimizer, self.dataset = self.accelerator.prepare(
                     self.optimizer, self.dataset
@@ -128,74 +123,43 @@ class Trainer:
                 ) = self.accelerator.prepare(
                     self.model, self.optimizer, self.dataset, self.scheduler
                 )
-                self.accelerator.register_for_checkpointing(self.scheduler)
             else:
                 self.model, self.optimizer, self.dataset = self.accelerator.prepare(
                     self.model, self.optimizer, self.dataset
                 )
 
-        self.state = TrainerState()
-        self.accelerator.register_for_checkpointing(self.state)
-
-    def _save_dist(self):
-        if self.accelerator.is_main_process:
-            logger.info("Saving full model distribution.")
-
-        is_fsdp = str(self.accelerator.distributed_type) == "FSDP"
-
-        if not is_fsdp:
-            model = self.accelerator.unwrap_model(self.model)
-            model_state = model.state_dict()
-            if hasattr(model, 'save_pretrained'):
-                model.save_pretrained(f"{self.output_dir}/dist", state_dict=model_state, token=self.hf_hub_token)
-            else:
-                os.makedirs(f"{self.output_dir}/dist", exist_ok=True)
-                torch.save(model_state, f"{self.output_dir}/dist/model.pt")
+        # Use pre-loaded state if provided, otherwise start fresh
+        if self.initial_state is not None:
+            self.state = self.initial_state
         else:
-            model = self.accelerator.unwrap_model(self.model)
-            if hasattr(model, 'save_pretrained'):
-                model.save_pretrained(
-                    f"{self.output_dir}/dist",
-                    is_main_process=self.accelerator.is_main_process,
-                    save_function=self.accelerator.save,
-                    state_dict=self.accelerator.get_state_dict(self.model),
-                    token=self.hf_hub_token
-                )
-            else:
-                state_dict = self.accelerator.get_state_dict(self.model)
-                if self.accelerator.is_main_process:
-                    os.makedirs(f"{self.output_dir}/dist", exist_ok=True)
-                    torch.save(state_dict, f"{self.output_dir}/dist/model.pt")
+            self.state = TrainerState()
+
+        # Initialize checkpoint manager
+        self.checkpoint_manager = CheckpointManager(self.output_dir)
+        self._checkpoint_iteration = self.checkpoint_manager.get_latest_checkpoint_num() or 0
+        if self.initial_state is not None:
+            self._checkpoint_iteration += 1
 
     def _save(self, no_dist=False):
+        rank = int(os.environ.get("RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        if self.accelerator.is_main_process:
+            logger.info(f"Saving checkpoint at step {self.state.steps} (total: {self.state.total_steps})")
         self.accelerator.wait_for_everyone()
-        self.accelerator.save_state()
-        if not no_dist:
-            self._save_dist()
 
-    def _load_last_checkpoint(self):
-        try:
-            checkpoints_dir = f"{self.output_dir}/checkpoints/"
-            if os.path.exists(checkpoints_dir) and os.listdir(checkpoints_dir):
-                files = os.listdir(checkpoints_dir)
-                checkpoint_files = [
-                    f for f in files
-                    if f.startswith("checkpoint_") and get_number_from_checkpoint(f) is not None
-                ]
-                checkpoint_files_sorted = sorted(checkpoint_files, key=lambda f: get_number_from_checkpoint(f) or 0)
-
-                if checkpoint_files_sorted:
-                    last_cp = checkpoint_files_sorted[-1]
-                    if self.accelerator.is_main_process:
-                        logger.info(f"Loading checkpoint: {last_cp}")
-                    self.accelerator.load_state(f"{self.output_dir}/checkpoints/{last_cp}")
-                    last_cp_num = last_cp.split("_")[-1]
-                    self.accelerator.project_configuration.iteration = int(last_cp_num) + 1
-                    return last_cp
-
-        except FileNotFoundError as e:
-            logger.warning(e)
-        return None
+        self.checkpoint_manager.save(
+            checkpoint_num=self._checkpoint_iteration,
+            model=self.accelerator.unwrap_model(self.model),
+            optimizer=self.optimizer,
+            training_state=self.state.state_dict(),
+            scheduler=self.scheduler if self.use_scheduler else None,
+            scaler=self.accelerator.scaler if hasattr(self.accelerator, 'scaler') and self.accelerator.scaler else None,
+            is_fsdp=self.is_fsdp,
+            rank=rank,
+            local_rank=local_rank,
+        )
+        self._checkpoint_iteration += 1
 
     def _log_pipeline(self):
         logger.info("Pipeline:")
@@ -214,7 +178,6 @@ class Trainer:
             context_manager = torch.autocast(device_type=self.device.type, dtype=self.f16_dtype)
 
         self.model.train()
-        # Use passed total_batches, or try to calculate from dataset length
         if self.total_batches is not None:
             total_batches = self.total_batches
         else:
@@ -223,14 +186,6 @@ class Trainer:
             except TypeError:
                 total_batches = None
         start_time = time.time()
-
-        if self.load_checkpoint:
-            last_cp = self._load_last_checkpoint()
-            if self.accelerator.is_main_process:
-                if last_cp:
-                    logger.info(f"Resuming training state from: {last_cp}.")
-                else:
-                    logger.info("No training state checkpoint found, starting fresh (model weights loaded separately).")
 
         atexit.register(self._save)
 
@@ -258,7 +213,6 @@ class Trainer:
                     "original_batch": original_batch,
                 }
 
-                # Preprocessors: batch -> batch_transformed
                 for preprocessor in self.preprocessors:
                     result = preprocessor.process(batch, ctx)
                     if result[0] is None:
@@ -275,7 +229,6 @@ class Trainer:
                         if not isinstance(model_output, tuple):
                             model_output = (model_output,)
 
-                        # Postprocessors: transform model output tuple
                         for postprocessor in self.postprocessors:
                             model_output, ctx = postprocessor.process(model_output, ctx)
 
@@ -291,7 +244,6 @@ class Trainer:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
 
-                    # Logging
                     time_elapsed = time.time() - start_time
                     if total_batches is not None:
                         batches_per_epoch = total_batches // epochs if epochs > 0 else total_batches
@@ -309,7 +261,7 @@ class Trainer:
                         batch_info = f"Batch {self.state.steps}/{batches_per_epoch}"
                         progress_info = f"{percent_done:.2f}% done | ETA: {estimated_time_remaining_ddhhmmss}"
                     else:
-                        current_epoch_decimal = ep + (self.state.steps / 1000)  # rough estimate
+                        current_epoch_decimal = ep + (self.state.steps / 1000)
                         batch_info = f"Batch {self.state.steps}"
                         progress_info = f"elapsed: {convert_seconds_to_string_time(time_elapsed)}"
 
@@ -320,7 +272,6 @@ class Trainer:
                             f"{metrics_str} | {progress_info}"
                         )
 
-                        # Log to external logger if provided
                         if self.metrics_logger:
                             for k, v in loss_output.metrics.items():
                                 self.metrics_logger.log_scalar(f"train/{k}", v, self.state.total_steps)

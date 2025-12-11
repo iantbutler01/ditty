@@ -15,6 +15,8 @@ from . import diffusion
 from .loss import LossCalculator, LossOutput, MSELoss, L1Loss, CrossEntropyLoss, CompositeLoss
 from .processors import PreProcessor, PostProcessor, Context
 from .model_factory import ModelFactory, TokenizerFactory, FSDPConfig, QuantConfig, PeftConfig, ModelTransform
+from .checkpoint import CheckpointManager, Checkpoint
+from .example import print_pipeline
 
 __all__ = [
     "DittyBase",
@@ -44,4 +46,7 @@ __all__ = [
     "QuantConfig",
     "PeftConfig",
     "ModelTransform",
+    "CheckpointManager",
+    "Checkpoint",
+    "print_pipeline",
 ]

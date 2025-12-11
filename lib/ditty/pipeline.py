@@ -11,13 +11,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from datasets import Dataset, IterableDataset
-from .trainer import Trainer
+from .trainer import Trainer, TrainerState
 from .data import Data
 from .hf_utils import push_to_hub
 from .model_factory import ModelFactory, TokenizerFactory
 from .loss import LossCalculator, MSELoss
 from .processors import PreProcessor, PostProcessor
 from .contract import parse_contract, validate_pipeline_chain, format_pipeline_contracts, ContractParseError
+from .checkpoint import CheckpointManager, Checkpoint
 
 
 logging.basicConfig(level=logging.INFO)
@@ -55,8 +56,6 @@ class Pipeline:
         metrics_logger: Optional[Any] = None,
         accelerator_kwargs: Dict[str, Any] = {},
         optimizer: Optional[torch.optim.Optimizer] = None,
-        use_compile: bool = False,
-        compile_mode: str = "default",
         # Hub options
         push_to_hub: bool = False,
         output_hub_repo: Optional[str] = None,
@@ -94,10 +93,8 @@ class Pipeline:
         self.log_every = log_every
         self.metrics_logger = metrics_logger
         self.accelerator_kwargs = accelerator_kwargs
-        self.optimizer = optimizer
-        self.use_compile = use_compile
-        self.compile_mode = compile_mode
-        self.push_to_hub = push_to_hub
+        self._user_optimizer = optimizer
+        self.push_to_hub_flag = push_to_hub
         self.output_hub_repo = output_hub_repo
         self.hf_hub_token = hf_hub_token or os.environ.get("HF_TOKEN")
         self.merge_adapters = merge_adapters
@@ -106,24 +103,21 @@ class Pipeline:
         self.num_workers = num_workers
         self.shuffle_buffer_size = shuffle_buffer_size
 
+        # Checkpoint manager for unified checkpoint handling
+        self.checkpoint_manager = CheckpointManager(output_dir)
+
         # Calculate dataset size and create dataloader
         self.dataloader, self.dataset_size, self.total_batches = self._prepare_dataloader()
 
-        if self.push_to_hub and not self.output_hub_repo:
+        if self.push_to_hub_flag and not self.output_hub_repo:
             raise ValueError("Cannot enable push to hub without providing output_hub_repo.")
 
         self._validate_contracts()
 
     def _prepare_dataloader(self):
-        """
-        Prepare dataloader from dataset, handling both HF Dataset and DataLoader inputs.
-        For HF Dataset: converts to iterable for streaming, calculates total_batches.
-        For DataLoader: uses as-is, tries to get length.
-        """
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         rank = int(os.environ.get("RANK", 0))
 
-        # If already a DataLoader, use it directly
         if isinstance(self._dataset, DataLoader):
             try:
                 dataset_size = len(self._dataset.dataset)
@@ -133,14 +127,12 @@ class Pipeline:
                 total_batches = None
             return self._dataset, dataset_size, total_batches
 
-        # HF Dataset - get size before converting to iterable
         dataset_size = len(self._dataset)
         total_batches = (dataset_size // world_size + self.batch_size - 1) // self.batch_size * self.epochs
 
         if rank == 0:
             logger.info(f"Dataset: {dataset_size:,} examples, ~{total_batches // self.epochs:,} batches per GPU per epoch")
 
-        # Convert to iterable dataset for streaming
         iterable_dataset = self._dataset.to_iterable_dataset(num_shards=128)
         iterable_dataset = iterable_dataset.shuffle(seed=42, buffer_size=self.shuffle_buffer_size)
 
@@ -155,7 +147,6 @@ class Pipeline:
         return dataloader, dataset_size, total_batches
 
     def _validate_contracts(self):
-        """Validate pipeline contracts chain together correctly."""
         parse_errors = []
 
         def strict_parse(component, label):
@@ -188,12 +179,10 @@ class Pipeline:
                 "Invalid contracts:\n  " + "\n  ".join(parse_errors)
             )
 
-        # Skip validation if any key contracts are missing
         if not model_contract or not loss_contract:
             logger.debug("Skipping contract validation - model or loss contract not specified")
             return
 
-        # Validate chain
         errors = validate_pipeline_chain(
             preprocessor_contracts,
             model_contract,
@@ -202,7 +191,6 @@ class Pipeline:
         )
 
         if errors:
-            # Log full pipeline contracts for debugging
             logger.info(format_pipeline_contracts(
                 [(p.name, strict_parse(p, p.name)) for p in self.preprocessors if strict_parse(p, p.name)],
                 ("model", model_contract),
@@ -213,16 +201,106 @@ class Pipeline:
                 "Pipeline contract validation errors:\n  " + "\n  ".join(errors)
             )
 
+    def _load_checkpoint_if_exists(self) -> tuple[Optional[Checkpoint], Optional[TrainerState]]:
+        """
+        Load checkpoint if it exists and load_checkpoint is True.
+        Returns (checkpoint, trainer_state) tuple.
+        """
+        if not self.load_checkpoint:
+            return None, None
+
+        checkpoint = self.checkpoint_manager.load()
+        if checkpoint is None:
+            return None, None
+
+        rank = int(os.environ.get("RANK", 0))
+        if rank == 0:
+            logger.info(f"Found checkpoint with training state: {checkpoint.training_state}")
+
+        trainer_state = TrainerState()
+        trainer_state.load_state_dict(checkpoint.training_state)
+
+        return checkpoint, trainer_state
+
+    def _create_optimizer(self, model: nn.Module, checkpoint: Optional[Checkpoint] = None):
+        """Create optimizer and optionally load state from checkpoint."""
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        lr = self.lr * world_size if world_size > 1 else self.lr
+        is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
+
+        if self._user_optimizer is not None:
+            optimizer = self._user_optimizer
+        elif self.use_8bit_optim:
+            if self.optim_backend == "bnb":
+                if is_fsdp:
+                    logger.warning("bitsandbytes 8-bit optimizer not compatible with FSDP2, falling back to torchao")
+                    from torchao.optim import AdamW8bit
+                    optimizer = AdamW8bit(
+                        model.parameters(),
+                        lr=lr,
+                        weight_decay=self.weight_decay,
+                        betas=(0.9, 0.999),
+                        eps=1e-8,
+                    )
+                else:
+                    optimizer = bnb.optim.Adam8bit(
+                        model.parameters(),
+                        lr=lr,
+                        weight_decay=self.weight_decay,
+                        betas=(0.9, 0.999),
+                        eps=1e-8,
+                    )
+            elif self.optim_backend == "torchao":
+                from torchao.optim import AdamW8bit
+                optimizer = AdamW8bit(
+                    model.parameters(),
+                    lr=lr,
+                    weight_decay=self.weight_decay,
+                    betas=(0.9, 0.999),
+                    eps=1e-8,
+                )
+            else:
+                raise ValueError(f"Unknown optim_backend: {self.optim_backend}")
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=lr,
+                weight_decay=self.weight_decay,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+            )
+
+        # Load optimizer state from checkpoint if available
+        if checkpoint is not None and checkpoint.optimizer_state is not None:
+            try:
+                self.checkpoint_manager.apply_to_optimizer(checkpoint, optimizer)
+            except Exception as e:
+                logger.warning(f"Failed to load optimizer state: {e}. Starting with fresh optimizer.")
+
+        return optimizer
+
     def run(self):
         if self.tokenizer_factory:
             self.tokenizer = self.tokenizer_factory.build()
 
         world_size = int(os.environ.get("WORLD_SIZE", 1))
+        rank = int(os.environ.get("RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
         if world_size > 1:
-            rank = int(os.environ.get("RANK", 0))
-            local_rank = int(os.environ.get("LOCAL_RANK", 0))
             logger.info(f"Distributed: rank {rank}, local_rank {local_rank}, world_size {world_size}")
 
+        # Step 1: Load checkpoint if exists (before building model)
+        checkpoint, trainer_state = self._load_checkpoint_if_exists()
+
+        if checkpoint is not None and checkpoint.model_state is not None:
+            # Inject model weights into model factory for loading
+            # The factory will use these instead of fresh initialization
+            self.model_factory._checkpoint_state = checkpoint.model_state
+            if rank == 0:
+                logger.info("Will load model weights from checkpoint")
+
+        # Step 2: Build model (with checkpoint weights if available)
         self.model = self.model_factory.build()
 
         if self.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
@@ -231,9 +309,16 @@ class Pipeline:
         if hasattr(self.model, "config"):
             self.model.config.use_cache = not self.gradient_checkpointing
 
-        if self.use_compile:
-            self.model = torch.compile(self.model, mode=self.compile_mode)
+        # Step 3: Create optimizer (and load optimizer state from checkpoint)
+        self.optimizer = self._create_optimizer(self.model, checkpoint)
 
+        # Step 4: Load RNG states if resuming
+        if checkpoint is not None:
+            self.checkpoint_manager.load_rng_state(rank=rank, local_rank=local_rank)
+            if rank == 0:
+                logger.info(f"Resuming from epoch {trainer_state.epoch}, step {trainer_state.steps}, total_steps {trainer_state.total_steps}")
+
+        # Step 5: Create accelerator
         acc_kwargs = {
             "gradient_accumulation_steps": self.grad_accum,
             "project_dir": self.output_dir,
@@ -256,52 +341,9 @@ class Pipeline:
             logger.info(f"  Trainable params: {trainable_params:,}")
             logger.info(f"  Loss calculator: {self.loss_calculator.__class__.__name__}")
 
-        if self.optimizer is None:
-            lr = self.lr * world_size if world_size > 1 else self.lr
-            is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
-
-            if self.use_8bit_optim:
-                if self.optim_backend == "bnb":
-                    if is_fsdp:
-                        logger.warning("bitsandbytes 8-bit optimizer not compatible with FSDP2, falling back to torchao")
-                        from torchao.optim import AdamW8bit
-                        self.optimizer = AdamW8bit(
-                            self.model.parameters(),
-                            lr=lr,
-                            weight_decay=self.weight_decay,
-                            betas=(0.9, 0.999),
-                            eps=1e-8,
-                        )
-                    else:
-                        self.optimizer = bnb.optim.Adam8bit(
-                            self.model.parameters(),
-                            lr=lr,
-                            weight_decay=self.weight_decay,
-                            betas=(0.9, 0.999),
-                            eps=1e-8,
-                        )
-                elif self.optim_backend == "torchao":
-                    from torchao.optim import AdamW8bit
-                    self.optimizer = AdamW8bit(
-                        self.model.parameters(),
-                        lr=lr,
-                        weight_decay=self.weight_decay,
-                        betas=(0.9, 0.999),
-                        eps=1e-8,
-                    )
-                else:
-                    raise ValueError(f"Unknown optim_backend: {self.optim_backend}")
-            else:
-                self.optimizer = torch.optim.AdamW(
-                    self.model.parameters(),
-                    lr=lr,
-                    weight_decay=self.weight_decay,
-                    betas=(0.9, 0.999),
-                    eps=1e-8,
-                )
-
+        # Step 6: Create trainer (prepare() happens inside trainer)
         trainer = Trainer(
-            model=self.model,  # type: ignore[arg-type]
+            model=self.model,
             optimizer=self.optimizer,
             accelerator=self.accelerator,
             dataset=self.dataloader,
@@ -314,7 +356,6 @@ class Pipeline:
             use_bfloat16=self.use_bfloat16,
             output_dir=self.output_dir,
             checkpoint_every=self.checkpoint_every,
-            load_checkpoint=self.load_checkpoint,
             seed=self.seed,
             use_scheduler=False,
             metrics_logger=self.metrics_logger,
@@ -324,13 +365,14 @@ class Pipeline:
             shuffle_each_epoch=self.shuffle_each_epoch,
             total_batches=self.total_batches,
             is_fsdp=self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False,
+            initial_state=trainer_state,
         )
 
         trainer.train(epochs=self.epochs, max_steps=self.max_steps)
 
         self.accelerator.wait_for_everyone()
 
-        if self.push_to_hub:
+        if self.push_to_hub_flag:
             model = self.accelerator.unwrap_model(self.model)
 
             if self.merge_adapters and hasattr(model, "merge_and_unload"):
