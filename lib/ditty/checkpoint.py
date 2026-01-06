@@ -21,6 +21,8 @@ class Checkpoint:
     training_state: Dict[str, Any] = field(default_factory=dict)
     scaler_state: Optional[Dict[str, Any]] = None
     rng_states: Dict[str, Any] = field(default_factory=dict)
+    loss_state: Optional[Dict[str, Any]] = None
+    loss_optimizer_state: Optional[Dict[str, Any]] = None  # optimizer state for loss_calculator params
 
 
 class CheckpointManager:
@@ -72,6 +74,7 @@ class CheckpointManager:
         training_state: Dict[str, Any],
         scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
         scaler: Optional[torch.amp.GradScaler] = None,
+        loss_calculator: Optional[Any] = None,
         is_fsdp: bool = False,
         rank: int = 0,
         local_rank: int = 0,
@@ -112,11 +115,85 @@ class CheckpointManager:
                 torch.save(unwrapped_model.state_dict(), model_path)
 
         # Save optimizer state
+        # When using FSDP with loss_calculator params in the optimizer, we need to
+        # save them separately because get_optimizer_state_dict only handles model params.
         optimizer_path = os.path.join(checkpoint_path, "optimizer.bin")
+        loss_optim_path = os.path.join(checkpoint_path, "loss_optimizer_state.pt")
+
         if is_fsdp:
             try:
                 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+                from torch.distributed.tensor import DTensor
+
+                # Get loss_calculator params in order (if any)
+                loss_params = []
+                if loss_calculator is not None and hasattr(loss_calculator, 'parameters'):
+                    loss_params = list(loss_calculator.parameters())
+
+                if loss_params:
+                    # Extract optimizer state for loss params before calling get_optimizer_state_dict
+                    full_optim_state = optimizer.state_dict()
+                    loss_optim_state = {"state": {}}
+
+                    # Map param id to index in optimizer
+                    param_id_to_idx = {}
+                    idx = 0
+                    for group in optimizer.param_groups:
+                        for p in group["params"]:
+                            param_id_to_idx[id(p)] = idx
+                            idx += 1
+
+                    # Extract state for loss params in order
+                    loss_param_indices = []
+                    for p in loss_params:
+                        pid = id(p)
+                        if pid in param_id_to_idx:
+                            param_idx = param_id_to_idx[pid]
+                            loss_param_indices.append(param_idx)
+                            if param_idx in full_optim_state["state"]:
+                                state_entry = full_optim_state["state"][param_idx]
+                                # Convert DTensors to regular tensors
+                                converted_state = {}
+                                for k, v in state_entry.items():
+                                    if isinstance(v, DTensor):
+                                        converted_state[k] = v.full_tensor().cpu()
+                                    elif isinstance(v, torch.Tensor):
+                                        converted_state[k] = v.cpu()
+                                    else:
+                                        converted_state[k] = v
+                                loss_optim_state["state"][param_idx] = converted_state
+
+                    loss_optim_state["param_indices"] = loss_param_indices
+                    loss_param_ids = {id(p) for p in loss_params}
+
+                    if rank == 0:
+                        torch.save(loss_optim_state, loss_optim_path)
+
+                    # Temporarily remove loss params from optimizer.param_groups and optimizer.state
+                    # so get_optimizer_state_dict doesn't try to map them
+                    popped_params = []
+                    for group in optimizer.param_groups:
+                        original_params = group["params"]
+                        filtered = [p for p in original_params if id(p) not in loss_param_ids]
+                        removed = [p for p in original_params if id(p) in loss_param_ids]
+                        popped_params.append((group, original_params, removed))
+                        group["params"] = filtered
+
+                    # Also pop from optimizer.state
+                    popped_state = {}
+                    for p in loss_params:
+                        if p in optimizer.state:
+                            popped_state[p] = optimizer.state.pop(p)
+
+                # Now get model optimizer state
                 optim_state = get_optimizer_state_dict(model, optimizer)
+
+                # Restore the popped params and state
+                if loss_params:
+                    for group, original_params, _ in popped_params:
+                        group["params"] = original_params
+                    for p, state in popped_state.items():
+                        optimizer.state[p] = state
             except ImportError:
                 optim_state = optimizer.state_dict()
         else:
@@ -139,6 +216,27 @@ class CheckpointManager:
         if scaler is not None and rank == 0:
             scaler_path = os.path.join(checkpoint_path, "scaler.pt")
             torch.save(scaler.state_dict(), scaler_path)
+
+        # Save loss calculator state (if it has learnable parameters)
+        # Note: full_tensor() is a collective op, so all ranks must call it together
+        if loss_calculator is not None:
+            loss_state = loss_calculator.state_dict()
+            if loss_state:  # Only save if non-empty
+                # Convert DTensors to full tensors for saving
+                from torch.distributed.tensor import DTensor
+                converted_state = {}
+                for k, v in loss_state.items():
+                    if isinstance(v, DTensor):
+                        # full_tensor() is collective - all ranks must call
+                        converted_state[k] = v.full_tensor().cpu()
+                    elif isinstance(v, torch.Tensor):
+                        converted_state[k] = v.cpu()
+                    else:
+                        converted_state[k] = v
+                # Only rank 0 saves to disk
+                if rank == 0:
+                    loss_path = os.path.join(checkpoint_path, "loss_state.pt")
+                    torch.save(converted_state, loss_path)
 
         # Save RNG states for this rank
         rng_state = {
@@ -209,6 +307,16 @@ class CheckpointManager:
         if os.path.exists(scaler_path):
             checkpoint.scaler_state = torch.load(scaler_path, map_location="cpu", weights_only=False)
 
+        # Load loss calculator state
+        loss_path = os.path.join(checkpoint_path, "loss_state.pt")
+        if os.path.exists(loss_path):
+            checkpoint.loss_state = torch.load(loss_path, map_location="cpu", weights_only=False)
+
+        # Load loss optimizer state (for loss_calculator params)
+        loss_optim_path = os.path.join(checkpoint_path, "loss_optimizer_state.pt")
+        if os.path.exists(loss_optim_path):
+            checkpoint.loss_optimizer_state = torch.load(loss_optim_path, map_location="cpu", weights_only=False)
+
         logger.info(f"Loaded checkpoint from {checkpoint_path}")
         return checkpoint
 
@@ -276,3 +384,85 @@ class CheckpointManager:
         if checkpoint.scaler_state is not None:
             scaler.load_state_dict(checkpoint.scaler_state)
             logger.info("Loaded scaler state from checkpoint")
+
+    def apply_to_loss_calculator(self, checkpoint: Checkpoint, loss_calculator: Any):
+        """Apply checkpoint loss state to a loss calculator."""
+        if checkpoint.loss_state is not None:
+            from torch.distributed.tensor import DTensor, Replicate
+
+            # Check if loss_calculator params are DTensors
+            state_dict = checkpoint.loss_state
+            current_state = loss_calculator.state_dict()
+
+            # Convert saved tensors to DTensors if needed
+            converted_state = {}
+            for k, v in state_dict.items():
+                if k in current_state and isinstance(current_state[k], DTensor):
+                    # Need to convert saved tensor to DTensor
+                    param_dtensor = current_state[k]
+                    if isinstance(v, torch.Tensor) and not isinstance(v, DTensor):
+                        converted_state[k] = DTensor.from_local(
+                            v.to(param_dtensor.device),
+                            device_mesh=param_dtensor.device_mesh,
+                            placements=[Replicate()] * param_dtensor.device_mesh.ndim,
+                            run_check=False,
+                        )
+                    else:
+                        converted_state[k] = v
+                else:
+                    converted_state[k] = v
+
+            loss_calculator.load_state_dict(converted_state)
+            logger.info("Loaded loss calculator state from checkpoint")
+
+    def apply_loss_optimizer_state(
+        self,
+        checkpoint: Checkpoint,
+        optimizer: torch.optim.Optimizer,
+        loss_calculator: Any,
+        is_fsdp: bool = False,
+    ):
+        """Apply saved loss optimizer state back into the optimizer."""
+        if checkpoint.loss_optimizer_state is None:
+            return
+
+        loss_optim_state = checkpoint.loss_optimizer_state
+        if not loss_optim_state.get("state"):
+            return
+
+        # Get loss_calculator params in order
+        loss_params = list(loss_calculator.parameters())
+        if len(loss_params) != len(loss_optim_state.get("param_indices", [])):
+            logger.warning(
+                f"Loss optimizer state mismatch: saved {len(loss_optim_state.get('param_indices', []))} params, "
+                f"current {len(loss_params)} params. Skipping."
+            )
+            return
+
+        # Inject saved state directly into optimizer.state keyed by param object
+        saved_indices = loss_optim_state["param_indices"]
+        for i, param in enumerate(loss_params):
+            saved_idx = saved_indices[i]
+            if saved_idx in loss_optim_state["state"]:
+                saved_state = loss_optim_state["state"][saved_idx]
+                device = param.device
+
+                restored_state = {}
+                for k, v in saved_state.items():
+                    if isinstance(v, torch.Tensor):
+                        from torch.distributed.tensor import DTensor, Replicate
+                        if is_fsdp and isinstance(param, DTensor):
+                            restored_state[k] = DTensor.from_local(
+                                v.to(device),
+                                device_mesh=param.device_mesh,
+                                placements=[Replicate()] * param.device_mesh.ndim,
+                                run_check=False,
+                            )
+                        else:
+                            restored_state[k] = v.to(device)
+                    else:
+                        restored_state[k] = v
+
+                optimizer.state[param] = restored_state
+
+        logger.info("Loaded loss optimizer state from checkpoint")

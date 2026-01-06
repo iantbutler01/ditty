@@ -16,7 +16,9 @@ from .loss import LossCalculator, LossOutput, MSELoss, L1Loss, CrossEntropyLoss,
 from .processors import PreProcessor, PostProcessor, Context
 from .model_factory import ModelFactory, TokenizerFactory, FSDPConfig, QuantConfig, PeftConfig, ModelTransform
 from .checkpoint import CheckpointManager, Checkpoint
+from .metrics_logger import MetricsLogger
 from .example import print_pipeline
+from . import optimizers
 
 __all__ = [
     "DittyBase",
@@ -48,5 +50,7 @@ __all__ = [
     "ModelTransform",
     "CheckpointManager",
     "Checkpoint",
+    "MetricsLogger",
     "print_pipeline",
+    "optimizers",
 ]

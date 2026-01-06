@@ -155,6 +155,7 @@ class Trainer:
             training_state=self.state.state_dict(),
             scheduler=self.scheduler if self.use_scheduler else None,
             scaler=self.accelerator.scaler if hasattr(self.accelerator, 'scaler') and self.accelerator.scaler else None,
+            loss_calculator=self.loss_calculator,
             is_fsdp=self.is_fsdp,
             rank=rank,
             local_rank=local_rank,
@@ -195,11 +196,6 @@ class Trainer:
             if self.shuffle_each_epoch and hasattr(dataset, 'set_epoch'):
                 dataset.set_epoch(ep)
 
-            if self.state.steps > 0:
-                if self.accelerator.is_main_process:
-                    logger.info(f"Resuming from batch {self.state.steps}, skipping {self.state.steps} batches.")
-                dataset = self.accelerator.skip_first_batches(self.dataset, self.state.steps)
-
             for batch in dataset:
                 if batch is None:
                     break
@@ -211,6 +207,7 @@ class Trainer:
                     "total_steps": self.state.total_steps,
                     "device": self.device,
                     "original_batch": original_batch,
+                    "model": self.model,
                 }
 
                 for preprocessor in self.preprocessors:
@@ -236,8 +233,18 @@ class Trainer:
                         loss = loss_output.loss
 
                     self.accelerator.backward(loss)
+
                     if self.max_grad_norm is not None and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                    # Log gradients AFTER clip_grad_norm_ to avoid FSDP2 sync issues
+                    # clip_grad_norm_ involves all-reduce, so all ranks must finish it first
+                    if (self.metrics_logger is not None and
+                        hasattr(self.metrics_logger, 'log_gradients') and
+                        hasattr(self.metrics_logger, 'gradient_log_every') and
+                        self.state.steps % self.metrics_logger.gradient_log_every == 0 and
+                        self.accelerator.is_main_process):
+                        self.metrics_logger.log_gradients(self.model, self.state.steps)
                     batch_loss = loss.item()
                     self.optimizer.step()
                     if self.use_scheduler and self.scheduler:
@@ -275,6 +282,11 @@ class Trainer:
                         if self.metrics_logger:
                             for k, v in loss_output.metrics.items():
                                 self.metrics_logger.log_scalar(f"train/{k}", v, self.state.total_steps)
+                            # Log learning rate if supported
+                            if hasattr(self.metrics_logger, 'log_lr'):
+                                self.metrics_logger.log_lr(self.optimizer, self.state.total_steps)
+                            # Log epoch progress
+                            self.metrics_logger.log_scalar("train/epoch", current_epoch_decimal, self.state.total_steps)
 
                     self.state.global_loss += batch_loss
 

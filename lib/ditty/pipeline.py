@@ -106,7 +106,10 @@ class Pipeline:
         # Checkpoint manager for unified checkpoint handling
         self.checkpoint_manager = CheckpointManager(output_dir)
 
-        # Calculate dataset size and create dataloader
+        # Load checkpoint early to enable fast dataset skipping
+        self._checkpoint, self._trainer_state = self._load_checkpoint_if_exists()
+
+        # Calculate dataset size and create dataloader (with skip if resuming)
         self.dataloader, self.dataset_size, self.total_batches = self._prepare_dataloader()
 
         if self.push_to_hub_flag and not self.output_hub_repo:
@@ -127,13 +130,26 @@ class Pipeline:
                 total_batches = None
             return self._dataset, dataset_size, total_batches
 
-        dataset_size = len(self._dataset)
+        dataset = self._dataset
+        dataset_size = len(dataset)
         total_batches = (dataset_size // world_size + self.batch_size - 1) // self.batch_size * self.epochs
 
         if rank == 0:
             logger.info(f"Dataset: {dataset_size:,} examples, ~{total_batches // self.epochs:,} batches per GPU per epoch")
 
-        iterable_dataset = self._dataset.to_iterable_dataset(num_shards=128)
+        # Fast skip for resuming: use select() before converting to iterable
+        if self._trainer_state is not None and self._trainer_state.steps > 0:
+            global_batch_size = self.batch_size * world_size
+            skip_samples = self._trainer_state.steps * global_batch_size
+            if skip_samples < len(dataset):
+                if rank == 0:
+                    logger.info(f"Fast skip: selecting samples {skip_samples:,} to {len(dataset):,} ({len(dataset) - skip_samples:,} remaining)")
+                dataset = dataset.select(range(skip_samples, len(dataset)))
+            else:
+                if rank == 0:
+                    logger.info(f"Skip exceeds dataset size ({skip_samples:,} >= {len(dataset):,}), starting from beginning")
+
+        iterable_dataset = dataset.to_iterable_dataset(num_shards=128)
         iterable_dataset = iterable_dataset.shuffle(seed=42, buffer_size=self.shuffle_buffer_size)
 
         dataloader = DataLoader(
@@ -228,6 +244,11 @@ class Pipeline:
         lr = self.lr * world_size if world_size > 1 else self.lr
         is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
 
+        # Collect parameters from model and loss calculator (if it's an nn.Module)
+        params = list(model.parameters())
+        if isinstance(self.loss_calculator, nn.Module):
+            params = params + list(self.loss_calculator.parameters())
+
         if self._user_optimizer is not None:
             optimizer = self._user_optimizer
         elif self.use_8bit_optim:
@@ -236,7 +257,7 @@ class Pipeline:
                     logger.warning("bitsandbytes 8-bit optimizer not compatible with FSDP2, falling back to torchao")
                     from torchao.optim import AdamW8bit
                     optimizer = AdamW8bit(
-                        model.parameters(),
+                        params,
                         lr=lr,
                         weight_decay=self.weight_decay,
                         betas=(0.9, 0.999),
@@ -244,7 +265,7 @@ class Pipeline:
                     )
                 else:
                     optimizer = bnb.optim.Adam8bit(
-                        model.parameters(),
+                        params,
                         lr=lr,
                         weight_decay=self.weight_decay,
                         betas=(0.9, 0.999),
@@ -253,7 +274,7 @@ class Pipeline:
             elif self.optim_backend == "torchao":
                 from torchao.optim import AdamW8bit
                 optimizer = AdamW8bit(
-                    model.parameters(),
+                    params,
                     lr=lr,
                     weight_decay=self.weight_decay,
                     betas=(0.9, 0.999),
@@ -263,7 +284,7 @@ class Pipeline:
                 raise ValueError(f"Unknown optim_backend: {self.optim_backend}")
         else:
             optimizer = torch.optim.AdamW(
-                model.parameters(),
+                params,
                 lr=lr,
                 weight_decay=self.weight_decay,
                 betas=(0.9, 0.999),
@@ -290,8 +311,8 @@ class Pipeline:
         if world_size > 1:
             logger.info(f"Distributed: rank {rank}, local_rank {local_rank}, world_size {world_size}")
 
-        # Step 1: Load checkpoint if exists (before building model)
-        checkpoint, trainer_state = self._load_checkpoint_if_exists()
+        # Step 1: Use checkpoint loaded in __init__ (for fast dataset skip)
+        checkpoint, trainer_state = self._checkpoint, self._trainer_state
 
         if checkpoint is not None and checkpoint.model_state is not None:
             # Inject model weights into model factory for loading
@@ -309,12 +330,24 @@ class Pipeline:
         if hasattr(self.model, "config"):
             self.model.config.use_cache = not self.gradient_checkpointing
 
+        # Shard loss calculator for FSDP2 compatibility no op if the flag isn't set on the loss class.
+        self.loss_calculator.setup_fsdp()
+
         # Step 3: Create optimizer (and load optimizer state from checkpoint)
         self.optimizer = self._create_optimizer(self.model, checkpoint)
 
         # Step 4: Load RNG states if resuming
         if checkpoint is not None:
             self.checkpoint_manager.load_rng_state(rank=rank, local_rank=local_rank)
+            # Load loss calculator state if available
+            if checkpoint.loss_state is not None:
+                self.checkpoint_manager.apply_to_loss_calculator(checkpoint, self.loss_calculator)
+            # Load loss optimizer state if available
+            if checkpoint.loss_optimizer_state is not None:
+                self.checkpoint_manager.apply_loss_optimizer_state(
+                    checkpoint, self.optimizer, self.loss_calculator,
+                    is_fsdp=getattr(self.loss_calculator, '_fsdp', False)
+                )
             if rank == 0:
                 logger.info(f"Resuming from epoch {trainer_state.epoch}, step {trainer_state.steps}, total_steps {trainer_state.total_steps}")
 
