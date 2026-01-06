@@ -177,11 +177,15 @@ class PropOpWrapper(nn.Module):
     Does NOT reimplement the forward pass - delegates to wrapped model.
     """
 
-    def __init__(self, model: nn.Module, config: PropOpConfig):
+    def __init__(self, model: nn.Module, config: PropOpConfig, debug_file=None):
         super().__init__()
         self.model = model
         self.config = config
         self.device = next(model.parameters()).device
+        self.debug_file = debug_file
+        self.sample_counter = 0
+        self.log_interval = 128  # Log every N samples
+        self._last_batch_loss = 0.0
 
         # Discover and wrap layers
         self.layer_states: List[LayerState] = []
@@ -304,6 +308,9 @@ class PropOpWrapper(nn.Module):
             losses: Per-sample losses for error-gain (optional)
         """
         n = len(y)
+        self.sample_counter += n
+        if losses is not None:
+            self._last_batch_loss = losses.mean().item()
 
         # Output error (cross-entropy gradient)
         probs = F.softmax(output, dim=-1)
@@ -322,7 +329,8 @@ class PropOpWrapper(nn.Module):
         # Error gain for hidden layers (per-sample learning rate boost)
         if losses is not None:
             batch_mean_loss = losses.mean()
-            error_gains = (losses - batch_mean_loss).clamp(0.0, 2.0)
+            loss_diff = losses - batch_mean_loss
+            error_gains = loss_diff.clamp(0.0, 2.0)
             hidden_lrs = self.config.lr * 0.25 * (1.0 + error_gains)  # hidden_lr_scale = 0.25
         else:
             hidden_lrs = torch.full((n,), self.config.lr * 0.25, device=self.device)
@@ -341,28 +349,29 @@ class PropOpWrapper(nn.Module):
         output_state.module.weight.data += self.config.lr * output_delta
 
         # === PHASE 2: Backward credit assignment ===
-        # Start from output layer's credit backward
+        # Credit flows backward through all layers with activation gating:
+        #   Credit2 = (Delta @ W3.T) * H2_active
+        #   Credit1 = (Credit2 @ W2.T) * H1_active
         credit = delta
         for state in reversed(self.layer_states):
             state.credit = credit
             credit = self._backward_credit(state, credit)
 
-        # === PHASE 3: Update hidden layers (output to input, recompute credit after each) ===
+        # === PHASE 3: Update hidden layers (output to input) ===
+        # Credit was computed once in Phase 2, no recompute needed
         for layer_idx in reversed(hidden_layer_indices):
             state = self.layer_states[layer_idx]
             self._apply_hidden_weight_update(state, hidden_lrs, layer_idx)
 
-            # Recompute credit through this layer with updated weights
-            if layer_idx > 0:
-                credit = state.credit
-                for i in range(layer_idx, -1, -1):
-                    s = self.layer_states[i]
-                    s.credit = credit
-                    credit = self._backward_credit(s, credit)
-
     @torch.no_grad()
     def end_batch(self):
         """EMA updates for cofire, lateral, theta, firing_rate."""
+        # Store weight norms before updates for debug
+        weight_norms_before = {}
+        weight_layers = [(i, s) for i, s in enumerate(self.layer_states) if s.eligibility is not None]
+        for idx, (i, state) in enumerate(weight_layers):
+            weight_norms_before[f'W{idx+1}'] = state.module.weight.data.norm().item()
+
         for i, state in enumerate(self.layer_states):
             if state.cofire is not None:
                 # Find post-activation output for this weight layer
@@ -373,6 +382,10 @@ class PropOpWrapper(nn.Module):
                 if self.config.use_theta:
                     self._update_theta(state, i)
                 self._update_firing_rate(state, post_activation)
+
+        # Debug logging
+        if self.debug_file is not None and self.sample_counter % self.log_interval == 0:
+            self._write_debug_log(weight_norms_before, weight_layers)
 
     def _find_post_activation(self, state_idx: int) -> torch.Tensor:
         """Find the post-activation output for a weight layer at state_idx."""
@@ -443,8 +456,6 @@ class PropOpWrapper(nn.Module):
         - Activity gating: update_scalars = hidden_lr * activity * credit
         - Lateral push subtraction
         """
-        n = input_data.shape[0]
-
         # Normalize input (optional)
         if self.config.normalize_updates:
             input_norms = input_data.norm(dim=1, keepdim=True) + 1e-8
@@ -623,7 +634,7 @@ class PropOpWrapper(nn.Module):
         # EMA update with decay
         tau = self.config.lateral_tau ** n
         decay = self.config.lateral_decay ** n
-        state.lateral = tau * state.lateral + (1 - tau) * batch_lateral
+        state.lateral = tau * state.lateral + (1 - tau) * (batch_lateral / n)
         state.lateral *= decay
         state.lateral.fill_diagonal_(0.0)
 
@@ -672,6 +683,89 @@ class PropOpWrapper(nn.Module):
         # EMA update with tau adjusted for batch size
         tau = self.config.firing_rate_tau ** n
         state.firing_rate = tau * state.firing_rate + (1 - tau) * avg_active
+
+    def _write_debug_log(self, weight_norms_before: dict, weight_layers: list):
+        """Write debug log entry in format compatible with visualize_debug.py."""
+        import json
+
+        # Get first hidden layer's cofire for stats
+        hidden_states = [s for _, s in weight_layers[:-1]]  # Exclude output layer
+        if not hidden_states:
+            return
+
+        state1 = hidden_states[0]
+        cofire = state1.cofire
+
+        # Get post-activation for sparsity
+        idx1 = weight_layers[0][0]
+        post_act = self._find_post_activation(idx1)
+        if post_act.dim() == 4:
+            post_act = post_act.mean(dim=(2, 3))
+        active1 = (post_act > 0).float()
+        avg_active1 = active1.mean(dim=0)
+        sparsity = 1.0 - avg_active1.mean().item()
+        n_active = (avg_active1 > 0.5).sum().item()
+
+        # Weight norms after
+        weight_norms_after = {}
+        for idx, (i, state) in enumerate(weight_layers):
+            weight_norms_after[f'W{idx+1}'] = state.module.weight.data.norm().item()
+
+        debug_entry = {
+            "sample": self.sample_counter,
+            "loss": self._last_batch_loss,
+            "signal": 0.0,
+            "sparsity": sparsity,
+            "n_active": int(n_active),
+            "n_strong_aligned": 0,
+            "n_weak_aligned": 0,
+            "cofire_min": cofire.min().item() if cofire is not None else 0,
+            "cofire_max": cofire.max().item() if cofire is not None else 0,
+            "cofire_mean": cofire.mean().item() if cofire is not None else 0,
+            "cofire_std": cofire.std().item() if cofire is not None else 0,
+            "n_clusters": 1,
+            "cluster_sizes": {},
+            "clusters": {},
+            "total_positive_update": 0.0,
+            "total_negative_update": 0.0,
+            "net_update": 0.0,
+            "W1_norm_before": weight_norms_before.get('W1', 0),
+            "W1_norm_after": weight_norms_after.get('W1', 0),
+            "W2_norm_before": weight_norms_before.get('W2', 0),
+            "W2_norm_after": weight_norms_after.get('W2', 0),
+        }
+
+        # Add layer 2 stats if 3-layer
+        if len(hidden_states) > 1:
+            state2 = hidden_states[1]
+            cofire2 = state2.cofire
+            idx2 = weight_layers[1][0]
+            post_act2 = self._find_post_activation(idx2)
+            if post_act2.dim() == 4:
+                post_act2 = post_act2.mean(dim=(2, 3))
+            active2 = (post_act2 > 0).float()
+            avg_active2 = active2.mean(dim=0)
+
+            debug_entry["is_3_layer"] = True
+            debug_entry["W3_norm"] = weight_norms_after.get('W3', 0)
+            debug_entry["hidden2_n_active"] = int((avg_active2 > 0.5).sum().item())
+            debug_entry["hidden2_sparsity"] = 1.0 - avg_active2.mean().item()
+            debug_entry["n_clusters2"] = 1
+            debug_entry["cluster_sizes2"] = {}
+            debug_entry["clusters2"] = {}
+
+            # Add lateral stats for debugging
+            if state1.lateral is not None:
+                debug_entry["lateral1_min"] = state1.lateral.min().item()
+                debug_entry["lateral1_max"] = state1.lateral.max().item()
+                debug_entry["lateral1_mean"] = state1.lateral.mean().item()
+            if state2.lateral is not None:
+                debug_entry["lateral2_min"] = state2.lateral.min().item()
+                debug_entry["lateral2_max"] = state2.lateral.max().item()
+                debug_entry["lateral2_mean"] = state2.lateral.mean().item()
+
+        self.debug_file.write(json.dumps(debug_entry) + "\n")
+        self.debug_file.flush()
 
     def _apply_norm_band(self, module: nn.Module, state: LayerState):
         """Keep column norms within band around target."""
