@@ -10,6 +10,7 @@ from .contract import (
 )
 from .pipeline import Pipeline
 from .trainer import Trainer, TrainerState
+from .config import BackpropConfig
 from .data import Data
 from . import diffusion
 from .loss import LossCalculator, LossOutput, MSELoss, L1Loss, CrossEntropyLoss, CompositeLoss
@@ -19,6 +20,7 @@ from .checkpoint import CheckpointManager, Checkpoint
 from .metrics_logger import MetricsLogger
 from .example import print_pipeline
 from . import optimizers
+from . import gradient_free
 
 __all__ = [
     "DittyBase",
@@ -32,6 +34,7 @@ __all__ = [
     "Pipeline",
     "Trainer",
     "TrainerState",
+    "BackpropConfig",
     "Data",
     "LossCalculator",
     "LossOutput",
@@ -53,4 +56,5 @@ __all__ = [
     "MetricsLogger",
     "print_pipeline",
     "optimizers",
+    "gradient_free",
 ]
