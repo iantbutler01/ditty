@@ -123,15 +123,66 @@ def _credit_flatten(module: nn.Module, state: LayerState, credit: torch.Tensor) 
 
 
 def _credit_pool_upsample(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
-    return F.interpolate(credit, size=state.input_cache.shape[2:], mode='nearest')
+    # Upsample and multiply by scale factor to preserve credit magnitude
+    input_size = state.input_cache.shape[2:]
+    output_size = credit.shape[2:]
+    scale = (input_size[0] / output_size[0]) * (input_size[1] / output_size[1])
+    return F.interpolate(credit, size=input_size, mode='nearest') * scale
 
 
 def _credit_pool1d_upsample(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
-    return F.interpolate(credit, size=state.input_cache.shape[2:], mode='nearest')
+    # Upsample and multiply by scale factor to preserve credit magnitude
+    input_size = state.input_cache.shape[2:]
+    output_size = credit.shape[2:]
+    scale = input_size[0] / output_size[0]
+    return F.interpolate(credit, size=input_size, mode='nearest') * scale
 
 
 def _credit_passthrough(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
     return credit
+
+
+def _credit_batchnorm1d(module: nn.BatchNorm1d, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
+    # Full credit propagation through BatchNorm1d including off-diagonal coupling
+    x = state.input_cache
+    gamma = module.weight
+
+    mean = x.mean(dim=0, keepdim=True)
+    var = x.var(dim=0, keepdim=True, unbiased=False)
+    std = torch.sqrt(var + module.eps)
+    x_hat = (x - mean) / std
+
+    # Credit through gamma scaling
+    credit_xhat = credit * gamma.view(1, -1)
+
+    # Credit through normalization (includes off-diagonal coupling)
+    credit_x = (credit_xhat - credit_xhat.mean(dim=0, keepdim=True)
+                - x_hat * (credit_xhat * x_hat).mean(dim=0, keepdim=True)) / std
+
+    return credit_x
+
+
+def _credit_batchnorm2d(module: nn.BatchNorm2d, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
+    # Full credit propagation through BatchNorm2d including off-diagonal coupling
+    x = state.input_cache
+    gamma = module.weight
+    N = x.shape[0] * x.shape[2] * x.shape[3]  # batch * H * W
+
+    mean = x.mean(dim=[0, 2, 3], keepdim=True)
+    var = x.var(dim=[0, 2, 3], keepdim=True, unbiased=False)
+    std = torch.sqrt(var + module.eps)
+    x_hat = (x - mean) / std
+
+    # Credit through gamma scaling
+    credit_xhat = credit * gamma.view(1, -1, 1, 1)
+
+    # Credit through normalization (includes off-diagonal coupling)
+    # Diagonal: (1 - 1/N) / std
+    # Off-diagonal: -1/N * (1 + x_hat_i * x_hat_j) / std
+    credit_x = (credit_xhat - credit_xhat.mean(dim=[0, 2, 3], keepdim=True)
+                - x_hat * (credit_xhat * x_hat).mean(dim=[0, 2, 3], keepdim=True)) / std
+
+    return credit_x
 
 
 # Registry mapping layer types to their credit backward function
@@ -157,11 +208,11 @@ CREDIT_BACKWARD_REGISTRY: Dict[Type[nn.Module], Callable] = {
     nn.AvgPool1d: _credit_pool1d_upsample,
     nn.AdaptiveAvgPool2d: _credit_pool_upsample,
     nn.AdaptiveMaxPool2d: _credit_pool_upsample,
-    # Normalization (pass through)
-    nn.BatchNorm1d: _credit_passthrough,
-    nn.BatchNorm2d: _credit_passthrough,
-    nn.LayerNorm: _credit_passthrough,
-    nn.GroupNorm: _credit_passthrough,
+    # Normalization (full credit propagation with off-diagonal coupling)
+    nn.BatchNorm1d: _credit_batchnorm1d,
+    nn.BatchNorm2d: _credit_batchnorm2d,
+    nn.LayerNorm: _credit_passthrough,  # TODO: proper LayerNorm credit
+    nn.GroupNorm: _credit_passthrough,  # TODO: proper GroupNorm credit
     nn.InstanceNorm2d: _credit_passthrough,
     # Reshape
     nn.Flatten: _credit_flatten,
@@ -266,7 +317,11 @@ class PropOpWrapper(nn.Module):
         def hook(module, inputs, output):
             # Apply theta (homeostatic threshold)
             if self.config.use_theta and weight_state.theta is not None:
-                output = output - weight_state.theta
+                if output.dim() == 4:
+                    # Conv: theta is (C,), broadcast to (1, C, 1, 1)
+                    output = output - weight_state.theta.view(1, -1, 1, 1)
+                else:
+                    output = output - weight_state.theta
 
             # Apply cofire forward modulation (coalition excitation)
             if self.config.use_cofire and self.config.cofire_forward and weight_state.cofire is not None:
@@ -496,6 +551,10 @@ class PropOpWrapper(nn.Module):
             padding=conv.padding,
             stride=conv.stride,
         )
+
+        # Normalize across spatial positions (dim=2)
+        if self.config.normalize_updates:
+            input_unfolded = F.normalize(input_unfolded, dim=2)
 
         # Flatten credit spatially: (N, C_out, H'*W')
         credit_flat = credit.view(credit.shape[0], credit.shape[1], -1)

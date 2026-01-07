@@ -31,5 +31,8 @@ class LayerState:
     cofire_pre: Optional[torch.Tensor] = None
     lateral_pre: Optional[torch.Tensor] = None
 
+    # MaxPool indices for proper credit routing
+    pool_indices: Optional[torch.Tensor] = None
+
     # Per-layer hyperparameters (computed from layer dimensions)
     lateral_strength: float = 1.0
