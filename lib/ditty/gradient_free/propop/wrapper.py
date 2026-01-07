@@ -71,11 +71,43 @@ def _credit_linear(module: nn.Linear, state: LayerState, credit: torch.Tensor) -
 
 
 def _credit_conv2d(module: nn.Conv2d, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
-    return F.conv_transpose2d(credit, module.weight, stride=module.stride, padding=module.padding)
+    # Handle output_padding for strided convs to get correct input size
+    output_padding = 0
+    if module.stride[0] > 1 and state.input_cache is not None:
+        input_size = state.input_cache.shape[2]
+        output_size = credit.shape[2]
+        expected_input = (output_size - 1) * module.stride[0] - 2 * module.padding[0] + module.dilation[0] * (module.kernel_size[0] - 1) + 1
+        output_padding = input_size - expected_input
+
+    return F.conv_transpose2d(
+        credit,
+        module.weight,
+        stride=module.stride,
+        padding=module.padding,
+        output_padding=output_padding,
+        groups=module.groups,
+        dilation=module.dilation,
+    )
 
 
 def _credit_conv1d(module: nn.Conv1d, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
-    return F.conv_transpose1d(credit, module.weight, stride=module.stride, padding=module.padding)
+    # Handle output_padding for strided convs to get correct input size
+    output_padding = 0
+    if module.stride[0] > 1 and state.input_cache is not None:
+        input_size = state.input_cache.shape[2]
+        output_size = credit.shape[2]
+        expected_input = (output_size - 1) * module.stride[0] - 2 * module.padding[0] + module.dilation[0] * (module.kernel_size[0] - 1) + 1
+        output_padding = input_size - expected_input
+
+    return F.conv_transpose1d(
+        credit,
+        module.weight,
+        stride=module.stride,
+        padding=module.padding,
+        output_padding=output_padding,
+        groups=module.groups,
+        dilation=module.dilation,
+    )
 
 
 def _credit_relu(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
@@ -122,20 +154,56 @@ def _credit_flatten(module: nn.Module, state: LayerState, credit: torch.Tensor) 
     return credit.view(state.input_cache.shape)
 
 
-def _credit_pool_upsample(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
-    # Upsample and multiply by scale factor to preserve credit magnitude
+def _credit_maxpool2d(module: nn.MaxPool2d, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
+    # Route credit only to max positions using stored indices
+    if state.pool_indices is not None:
+        input_size = state.input_cache.shape
+        return F.max_unpool2d(
+            credit,
+            state.pool_indices,
+            kernel_size=module.kernel_size,
+            stride=module.stride,
+            padding=module.padding,
+            output_size=input_size,
+        )
+    # Fallback to uniform distribution if indices not available
+    input_size = state.input_cache.shape[2:]
+    scale = (input_size[0] / credit.shape[2]) * (input_size[1] / credit.shape[3])
+    return F.interpolate(credit, size=input_size, mode='nearest') * scale
+
+
+def _credit_maxpool1d(module: nn.MaxPool1d, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
+    # Route credit only to max positions using stored indices
+    if state.pool_indices is not None:
+        input_size = state.input_cache.shape
+        return F.max_unpool1d(
+            credit,
+            state.pool_indices,
+            kernel_size=module.kernel_size,
+            stride=module.stride,
+            padding=module.padding,
+            output_size=input_size,
+        )
+    # Fallback to uniform distribution if indices not available
+    input_size = state.input_cache.shape[2:]
+    scale = input_size[0] / credit.shape[2]
+    return F.interpolate(credit, size=input_size, mode='nearest') * scale
+
+
+def _credit_avgpool2d(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
+    # AvgPool distributes credit uniformly (correct behavior)
     input_size = state.input_cache.shape[2:]
     output_size = credit.shape[2:]
     scale = (input_size[0] / output_size[0]) * (input_size[1] / output_size[1])
-    return F.interpolate(credit, size=input_size, mode='nearest') * scale
+    return F.interpolate(credit, size=input_size, mode='nearest') / scale
 
 
-def _credit_pool1d_upsample(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
-    # Upsample and multiply by scale factor to preserve credit magnitude
+def _credit_avgpool1d(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
+    # AvgPool distributes credit uniformly (correct behavior)
     input_size = state.input_cache.shape[2:]
     output_size = credit.shape[2:]
     scale = input_size[0] / output_size[0]
-    return F.interpolate(credit, size=input_size, mode='nearest') * scale
+    return F.interpolate(credit, size=input_size, mode='nearest') / scale
 
 
 def _credit_passthrough(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
@@ -147,17 +215,24 @@ def _credit_batchnorm1d(module: nn.BatchNorm1d, state: LayerState, credit: torch
     x = state.input_cache
     gamma = module.weight
 
-    mean = x.mean(dim=0, keepdim=True)
-    var = x.var(dim=0, keepdim=True, unbiased=False)
-    std = torch.sqrt(var + module.eps)
-    x_hat = (x - mean) / std
+    if module.training:
+        # Training mode: use batch statistics (with off-diagonal coupling)
+        mean = x.mean(dim=0, keepdim=True)
+        var = x.var(dim=0, keepdim=True, unbiased=False)
+        std = torch.sqrt(var + module.eps)
+        x_hat = (x - mean) / std
 
-    # Credit through gamma scaling
-    credit_xhat = credit * gamma.view(1, -1)
+        # Credit through gamma scaling
+        credit_xhat = credit * gamma.view(1, -1)
 
-    # Credit through normalization (includes off-diagonal coupling)
-    credit_x = (credit_xhat - credit_xhat.mean(dim=0, keepdim=True)
-                - x_hat * (credit_xhat * x_hat).mean(dim=0, keepdim=True)) / std
+        # Credit through normalization (includes off-diagonal coupling)
+        credit_x = (credit_xhat - credit_xhat.mean(dim=0, keepdim=True)
+                    - x_hat * (credit_xhat * x_hat).mean(dim=0, keepdim=True)) / std
+    else:
+        # Eval mode: use running stats (diagonal only, no coupling)
+        std = torch.sqrt(module.running_var + module.eps)
+        # Simple diagonal scaling: gamma / std
+        credit_x = credit * (gamma / std).view(1, -1)
 
     return credit_x
 
@@ -166,21 +241,25 @@ def _credit_batchnorm2d(module: nn.BatchNorm2d, state: LayerState, credit: torch
     # Full credit propagation through BatchNorm2d including off-diagonal coupling
     x = state.input_cache
     gamma = module.weight
-    N = x.shape[0] * x.shape[2] * x.shape[3]  # batch * H * W
 
-    mean = x.mean(dim=[0, 2, 3], keepdim=True)
-    var = x.var(dim=[0, 2, 3], keepdim=True, unbiased=False)
-    std = torch.sqrt(var + module.eps)
-    x_hat = (x - mean) / std
+    if module.training:
+        # Training mode: use batch statistics (with off-diagonal coupling)
+        mean = x.mean(dim=[0, 2, 3], keepdim=True)
+        var = x.var(dim=[0, 2, 3], keepdim=True, unbiased=False)
+        std = torch.sqrt(var + module.eps)
+        x_hat = (x - mean) / std
 
-    # Credit through gamma scaling
-    credit_xhat = credit * gamma.view(1, -1, 1, 1)
+        # Credit through gamma scaling
+        credit_xhat = credit * gamma.view(1, -1, 1, 1)
 
-    # Credit through normalization (includes off-diagonal coupling)
-    # Diagonal: (1 - 1/N) / std
-    # Off-diagonal: -1/N * (1 + x_hat_i * x_hat_j) / std
-    credit_x = (credit_xhat - credit_xhat.mean(dim=[0, 2, 3], keepdim=True)
-                - x_hat * (credit_xhat * x_hat).mean(dim=[0, 2, 3], keepdim=True)) / std
+        # Credit through normalization (includes off-diagonal coupling)
+        credit_x = (credit_xhat - credit_xhat.mean(dim=[0, 2, 3], keepdim=True)
+                    - x_hat * (credit_xhat * x_hat).mean(dim=[0, 2, 3], keepdim=True)) / std
+    else:
+        # Eval mode: use running stats (diagonal only, no coupling)
+        std = torch.sqrt(module.running_var + module.eps)
+        # Simple diagonal scaling: gamma / std
+        credit_x = credit * (gamma / std).view(1, -1, 1, 1)
 
     return credit_x
 
@@ -201,13 +280,13 @@ CREDIT_BACKWARD_REGISTRY: Dict[Type[nn.Module], Callable] = {
     nn.Tanh: _credit_tanh,
     nn.Softplus: _credit_softplus,
     nn.ELU: _credit_elu,
-    # Pooling (upsample credit back)
-    nn.MaxPool2d: _credit_pool_upsample,
-    nn.MaxPool1d: _credit_pool1d_upsample,
-    nn.AvgPool2d: _credit_pool_upsample,
-    nn.AvgPool1d: _credit_pool1d_upsample,
-    nn.AdaptiveAvgPool2d: _credit_pool_upsample,
-    nn.AdaptiveMaxPool2d: _credit_pool_upsample,
+    # Pooling
+    nn.MaxPool2d: _credit_maxpool2d,
+    nn.MaxPool1d: _credit_maxpool1d,
+    nn.AvgPool2d: _credit_avgpool2d,
+    nn.AvgPool1d: _credit_avgpool1d,
+    nn.AdaptiveAvgPool2d: _credit_avgpool2d,
+    nn.AdaptiveMaxPool2d: _credit_avgpool2d,  # Adaptive doesn't have indices
     # Normalization (full credit propagation with off-diagonal coupling)
     nn.BatchNorm1d: _credit_batchnorm1d,
     nn.BatchNorm2d: _credit_batchnorm2d,
@@ -280,6 +359,11 @@ class PropOpWrapper(nn.Module):
                 # when we see the following activation
                 state = LayerState(module=child, device=self.device)
                 self.layer_states.append(state)
+
+                # Enable return_indices for MaxPool layers to capture max positions
+                if isinstance(child, (nn.MaxPool2d, nn.MaxPool1d)):
+                    child.return_indices = True
+
                 child.register_forward_hook(self._make_cache_hook(state))
                 prev_module = child
                 prev_state = state
@@ -309,7 +393,13 @@ class PropOpWrapper(nn.Module):
         """Hook that caches input/output during forward pass."""
         def hook(module, inputs, output):
             state.input_cache = inputs[0].detach()
-            state.output_cache = output.detach()
+            # Handle MaxPool with return_indices=True (returns tuple)
+            if isinstance(output, tuple):
+                state.output_cache = output[0].detach()
+                state.pool_indices = output[1].detach()
+            else:
+                state.output_cache = output.detach()
+                state.pool_indices = None
         return hook
 
     def _make_theta_hook(self, weight_state: LayerState):
@@ -411,6 +501,8 @@ class PropOpWrapper(nn.Module):
         for state in reversed(self.layer_states):
             state.credit = credit
             credit = self._backward_credit(state, credit)
+            # Clip credit to prevent explosion through deep networks
+            credit = credit.clamp(-self.config.credit_clip, self.config.credit_clip)
 
         # === PHASE 3: Update hidden layers (output to input) ===
         # Credit was computed once in Phase 2, no recompute needed
@@ -570,6 +662,10 @@ class PropOpWrapper(nn.Module):
         # Weight update: einsum over batch and spatial
         # delta[c_out, c_in*kH*kW] = sum over n,s of update_scalars[n,c_out,s] * input[n,c_in*kH*kW,s]
         delta = torch.einsum('nos,nis->oi', update_scalars, input_unfolded)
+
+        # Normalize by spatial positions (conv sums over more terms than linear)
+        num_spatial = input_unfolded.shape[2]
+        delta = delta / num_spatial
 
         # Reshape to conv weight shape: (C_out, C_in, kH, kW)
         delta = delta.view(conv.weight.shape)
@@ -827,12 +923,13 @@ class PropOpWrapper(nn.Module):
         self.debug_file.flush()
 
     def _apply_norm_band(self, module: nn.Module, state: LayerState):
-        """Keep column norms within band around target."""
+        """Keep column norms within band around target via gentle multiplicative rescaling."""
         band = self.config.norm_band
         if band is None:
             return
 
         W = module.weight.data
+        norm_lr = self.config.norm_lr  # Gentle rescaling factor (default 0.01)
 
         if isinstance(module, nn.Linear):
             # For Linear: norms along input dimension (columns)
@@ -847,11 +944,13 @@ class PropOpWrapper(nn.Module):
         low = target * (1.0 - band)
         high = target * (1.0 + band)
 
+        # Gentle multiplicative rescaling (matches main.py)
         scale = torch.ones_like(col_norms)
         too_low = col_norms < low
         too_high = col_norms > high
-        scale[too_low] = low / col_norms[too_low]
-        scale[too_high] = high / col_norms[too_high]
+        # Use power of norm_lr for gradual adjustment instead of hard clamping
+        scale[too_low] = (low / col_norms[too_low]) ** norm_lr
+        scale[too_high] = (high / col_norms[too_high]) ** norm_lr
 
         if isinstance(module, nn.Linear):
             module.weight.data *= scale.unsqueeze(1)

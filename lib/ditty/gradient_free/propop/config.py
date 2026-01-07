@@ -20,6 +20,8 @@ class PropOpConfig:
     activity_gate: bool = True  # Gate credit by activity
     normalize_updates: bool = True  # Normalize input in weight updates
     norm_band: Optional[float] = None  # Weight norm banding (None = disabled)
+    norm_lr: float = 0.01  # Learning rate for gentle norm banding rescaling
+    credit_clip: float = 10.0  # Max absolute credit value (like gradient clipping)
 
     # Hyperparameters
     cofire_tau: float = 0.33  # EMA decay for cofire matrix
