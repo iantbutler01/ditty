@@ -7,6 +7,7 @@ from enum import Enum, auto
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models.resnet import BasicBlock, Bottleneck
 
 from .config import PropOpConfig
 from .state import LayerState
@@ -19,6 +20,7 @@ class LayerKind(Enum):
     POOL = auto()        # Spatial pooling
     NORM = auto()        # Normalization layers
     RESHAPE = auto()     # Shape manipulation (Flatten)
+    RESIDUAL = auto()    # Residual block with skip connection
     UNKNOWN = auto()     # Unrecognized - pass through
 
 
@@ -53,6 +55,9 @@ LAYER_REGISTRY: Dict[Type[nn.Module], LayerKind] = {
     nn.InstanceNorm2d: LayerKind.NORM,
     # Reshape
     nn.Flatten: LayerKind.RESHAPE,
+    # Residual blocks
+    BasicBlock: LayerKind.RESIDUAL,
+    Bottleneck: LayerKind.RESIDUAL,
 }
 
 
@@ -191,8 +196,14 @@ def _credit_maxpool1d(module: nn.MaxPool1d, state: LayerState, credit: torch.Ten
 
 
 def _credit_avgpool2d(module: nn.Module, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
-    # AvgPool distributes credit uniformly (correct behavior)
+    # AvgPool distributes credit uniformly
     input_size = state.input_cache.shape[2:]
+
+    # Handle case where credit is 2D (from Linear after Flatten)
+    # Reshape to 4D with spatial dims of 1
+    if credit.dim() == 2:
+        credit = credit.unsqueeze(-1).unsqueeze(-1)
+
     output_size = credit.shape[2:]
     scale = (input_size[0] / output_size[0]) * (input_size[1] / output_size[1])
     return F.interpolate(credit, size=input_size, mode='nearest') / scale
@@ -319,10 +330,129 @@ class PropOpWrapper(nn.Module):
 
         # Discover and wrap layers
         self.layer_states: List[LayerState] = []
+        # Depth + offset tracking for nested residual blocks
+        # _depth_offsets[d] = starting offset in layer_states at depth d
+        self._depth = 0
+        self._depth_offsets: List[int] = [0]  # offset at depth 0 is 0
+        self._current_block_state: Optional[LayerState] = None  # Block we're currently inside
         self._wire_up(model)
 
-    def _wire_up(self, module: nn.Module):
-        """Walk model tree, register hooks, create LayerState for each layer."""
+    def _wire_up(self, model: nn.Module):
+        """Build DAG from FX trace if possible, fallback to tree walk."""
+        import torch.fx as fx
+
+        try:
+            traced = fx.symbolic_trace(model)
+            self._wire_up_fx(traced)
+            print(f"FX wiring: {len(self.layer_states)} states, {len(getattr(self, 'merge_points', {}))} merge points")
+        except Exception as e:
+            print(f"FX trace failed ({e}), using tree walk")
+            self._wire_up_tree(model)
+
+    def _wire_up_fx(self, traced):
+        """Build LayerState DAG from FX traced graph.
+
+        Iterates FX nodes in topological order, creating states and linking predecessors.
+        Merge points (operator.add) are tracked so credit branches properly.
+        """
+        import operator
+        import torch.fx as fx
+
+        self.merge_points = {}  # add_node_name -> [input_node_names]
+        node_to_state: Dict[str, LayerState] = {}  # fx node name -> LayerState
+        self._traced = traced  # Keep reference for credit backward
+
+        last_weight_state = None
+
+        for node in traced.graph.nodes:
+            if node.op == 'placeholder':
+                # Input node - no state, but track for predecessor lookup
+                pass
+
+            elif node.op == 'call_function' and node.target == operator.add:
+                # Merge point: record inputs, next module will get both as predecessors
+                inputs = [arg.name for arg in node.args if isinstance(arg, fx.Node)]
+                self.merge_points[node.name] = inputs
+                # Create a virtual state to track the merge output
+                # (needed so next node can reference it)
+                node_to_state[node.name] = None  # Placeholder - credit will branch here
+
+            elif node.op == 'call_function' or node.op == 'call_method':
+                # Non-add function calls (flatten, view, etc.) - pass through predecessor
+                # Find the first input node that has a state and use that
+                inputs = [arg.name for arg in node.args if isinstance(arg, fx.Node)]
+                for inp in inputs:
+                    if inp in node_to_state and node_to_state[inp] is not None:
+                        node_to_state[node.name] = node_to_state[inp]
+                        break
+                    elif inp in self.merge_points:
+                        # Point to one of the merge inputs (arbitrary - credit flows both ways)
+                        for merge_input in self.merge_points[inp]:
+                            if merge_input in node_to_state and node_to_state[merge_input] is not None:
+                                node_to_state[node.name] = node_to_state[merge_input]
+                                break
+                        if node.name in node_to_state:
+                            break
+
+            elif node.op == 'call_module':
+                module = traced.get_submodule(node.target)
+                kind = get_layer_kind(module)
+
+                # Get predecessor states from args
+                pred_names = [arg.name for arg in node.args if isinstance(arg, fx.Node)]
+                predecessors = []
+                for pname in pred_names:
+                    if pname in self.merge_points:
+                        # This node follows a merge - get both merge inputs as predecessors
+                        for merge_input in self.merge_points[pname]:
+                            if merge_input in node_to_state and node_to_state[merge_input] is not None:
+                                predecessors.append(node_to_state[merge_input])
+                    elif pname in node_to_state and node_to_state[pname] is not None:
+                        predecessors.append(node_to_state[pname])
+
+                # Create appropriate state
+                if kind == LayerKind.WEIGHT:
+                    state = self._create_weight_layer_state(module)
+                    last_weight_state = state
+                else:
+                    state = LayerState(module=module, device=self.device)
+
+                # Link predecessors
+                state.predecessors = predecessors if predecessors else None
+
+                # Enable return_indices for MaxPool layers
+                if isinstance(module, (nn.MaxPool2d, nn.MaxPool1d)):
+                    module.return_indices = True
+
+                # Register hooks
+                module.register_forward_hook(self._make_cache_hook(state))
+
+                # Link weight layer to following activation for post_activation_state
+                if kind == LayerKind.ACTIVATION and last_weight_state is not None:
+                    last_weight_state.post_activation_state = state
+                    last_weight_state = None
+
+                # Track state
+                node_to_state[node.name] = state
+                self.layer_states.append(state)
+
+            elif node.op == 'output':
+                # Mark the output state (last state before output)
+                output_args = [arg.name for arg in node.args if isinstance(arg, fx.Node)]
+                if output_args and output_args[0] in node_to_state:
+                    self._output_state = node_to_state[output_args[0]]
+
+        # Store node mapping for credit backward
+        self._node_to_state = node_to_state
+
+    def _wire_up_tree(self, module: nn.Module):
+        """Fallback: Walk model tree, register hooks, create LayerState for each layer.
+
+        Uses depth + offset tracking for residual blocks:
+        - When entering a block: increment depth, store offset, recurse
+        - Child states get collected into block's child_states list
+        - When exiting: restore depth, children are accessible via block.child_states
+        """
         last_weight_state = None
         prev_module = None
         prev_state = None
@@ -332,10 +462,30 @@ class PropOpWrapper(nn.Module):
 
             if kind == LayerKind.UNKNOWN:
                 # Recurse into containers (Sequential, ModuleList, etc.)
-                self._wire_up(child)
+                self._wire_up_tree(child)
+            elif kind == LayerKind.RESIDUAL:
+                # Residual block: cache input/output for skip credit, then recurse
+                state = LayerState(module=child, device=self.device, child_states=[])
+                self.layer_states.append(state)
+                child.register_forward_hook(self._make_cache_hook(state))
+
+                # Enter block: increment depth, track offset
+                self._depth += 1
+                self._depth_offsets.append(len(self.layer_states))  # Children start here
+                parent_block = self._current_block_state
+                self._current_block_state = state
+
+                # Recurse to wire up internal layers (conv, bn, relu, etc.)
+                self._wire_up_tree(child)
+
+                # Exit block: restore depth, children are now in state.child_states
+                self._depth -= 1
+                self._depth_offsets.pop()
+                self._current_block_state = parent_block
+
             elif kind == LayerKind.WEIGHT:
                 state = self._create_weight_layer_state(child)
-                self.layer_states.append(state)
+                self._add_state(state)
                 child.register_forward_hook(self._make_cache_hook(state))
                 last_weight_state = state
                 prev_module = child
@@ -349,8 +499,14 @@ class PropOpWrapper(nn.Module):
 
                 # Cache activations
                 state = LayerState(module=child, device=self.device)
-                self.layer_states.append(state)
+                self._add_state(state)
                 child.register_forward_hook(self._make_cache_hook(state))
+
+                # Link preceding weight layer to this activation
+                if last_weight_state is not None:
+                    last_weight_state.post_activation_state = state
+                    last_weight_state = None  # Don't link multiple activations to same weight
+
                 prev_module = child
                 prev_state = state
             else:
@@ -358,7 +514,7 @@ class PropOpWrapper(nn.Module):
                 # prev_module is updated so theta hook goes on THIS layer (e.g., BatchNorm)
                 # when we see the following activation
                 state = LayerState(module=child, device=self.device)
-                self.layer_states.append(state)
+                self._add_state(state)
 
                 # Enable return_indices for MaxPool layers to capture max positions
                 if isinstance(child, (nn.MaxPool2d, nn.MaxPool1d)):
@@ -367,6 +523,32 @@ class PropOpWrapper(nn.Module):
                 child.register_forward_hook(self._make_cache_hook(state))
                 prev_module = child
                 prev_state = state
+
+    def _add_state(self, state: LayerState):
+        """Add state to appropriate container based on nesting depth.
+
+        When inside a residual block (depth > 0), add to block's child_states only.
+        At top level (depth == 0), add to flat layer_states.
+        """
+        if self._current_block_state is not None:
+            # Inside a block: add to block's children only
+            self._current_block_state.child_states.append(state)
+        else:
+            # Top level: add to flat list
+            self.layer_states.append(state)
+
+    def _iter_all_states(self, states: List[LayerState] = None):
+        """Iterate over all states including nested children (depth-first)."""
+        if states is None:
+            states = self.layer_states
+        for state in states:
+            yield state
+            if state.child_states:
+                yield from self._iter_all_states(state.child_states)
+
+    def _get_all_weight_states(self) -> List[LayerState]:
+        """Get all weight-bearing layer states (including nested)."""
+        return [s for s in self._iter_all_states() if s.eligibility is not None]
 
     def _create_weight_layer_state(self, module: nn.Module) -> LayerState:
         """Initialize learning state for weight-bearing layers."""
@@ -387,6 +569,10 @@ class PropOpWrapper(nn.Module):
             firing_rate=torch.ones(out_dim, device=self.device) * self.config.target_fire,
             eligibility=torch.zeros_like(module.weight.data),
             lateral_strength=lateral_strength,
+            # Per-layer learnable echo params (start from global config)
+            echo_tau=self.config.echo_tau_init,
+            echo_strength=self.config.echo_strength_init,
+            credit_variance_ema=0.0,
         )
 
     def _make_cache_hook(self, state: LayerState):
@@ -438,7 +624,7 @@ class PropOpWrapper(nn.Module):
 
     def begin_batch(self):
         """Snapshot frozen state for batch-consistent lateral computation."""
-        for state in self.layer_states:
+        for state in self._iter_all_states():
             if state.cofire is not None:
                 state.cofire_pre = state.cofire.clone()
                 state.lateral_pre = state.lateral.clone()
@@ -462,14 +648,14 @@ class PropOpWrapper(nn.Module):
         delta = -probs.clone()
         delta[torch.arange(n, device=self.device), y] += 1.0
 
-        # Find weight layers (have eligibility)
-        weight_layer_indices = [i for i, s in enumerate(self.layer_states) if s.eligibility is not None]
-        if not weight_layer_indices:
+        # Find weight layers (have eligibility) - includes nested
+        weight_states = self._get_all_weight_states()
+        if not weight_states:
             return
 
-        # Identify output layer (last weight layer)
-        output_layer_idx = weight_layer_indices[-1]
-        hidden_layer_indices = weight_layer_indices[:-1]
+        # Identify output layer (last weight layer) and hidden layers
+        output_state = weight_states[-1]
+        hidden_states = weight_states[:-1]
 
         # Error gain for hidden layers (per-sample learning rate boost)
         if losses is not None:
@@ -481,7 +667,6 @@ class PropOpWrapper(nn.Module):
             hidden_lrs = torch.full((n,), self.config.lr * 0.25, device=self.device)
 
         # === PHASE 1: Update output layer (simple, no activity gating/lateral) ===
-        output_state = self.layer_states[output_layer_idx]
         input_to_output = output_state.input_cache  # H2 in 3-layer
 
         # Normalize input
@@ -497,53 +682,203 @@ class PropOpWrapper(nn.Module):
         # Credit flows backward through all layers with activation gating:
         #   Credit2 = (Delta @ W3.T) * H2_active
         #   Credit1 = (Credit2 @ W2.T) * H1_active
+        # For residual blocks: credit branches at output, merges at input
         credit = delta
-        for state in reversed(self.layer_states):
-            state.credit = credit
-            credit = self._backward_credit(state, credit)
-            # Clip credit to prevent explosion through deep networks
-            credit = credit.clamp(-self.config.credit_clip, self.config.credit_clip)
+        credit = self._backward_credit_recursive(self.layer_states, credit)
 
         # === PHASE 3: Update hidden layers (output to input) ===
         # Credit was computed once in Phase 2, no recompute needed
-        for layer_idx in reversed(hidden_layer_indices):
-            state = self.layer_states[layer_idx]
-            self._apply_hidden_weight_update(state, hidden_lrs, layer_idx)
+        for state in reversed(hidden_states):
+            self._apply_hidden_weight_update(state, hidden_lrs)
 
     @torch.no_grad()
     def end_batch(self):
         """EMA updates for cofire, lateral, theta, firing_rate."""
         # Store weight norms before updates for debug
         weight_norms_before = {}
-        weight_layers = [(i, s) for i, s in enumerate(self.layer_states) if s.eligibility is not None]
-        for idx, (i, state) in enumerate(weight_layers):
+        weight_states = self._get_all_weight_states()
+        for idx, state in enumerate(weight_states):
             weight_norms_before[f'W{idx+1}'] = state.module.weight.data.norm().item()
 
-        for i, state in enumerate(self.layer_states):
+        for state in self._iter_all_states():
             if state.cofire is not None:
                 # Find post-activation output for this weight layer
-                post_activation = self._find_post_activation(i)
+                post_activation = self._get_post_activation(state)
                 self._update_cofire(state, post_activation)
                 if self.config.use_lateral:
                     self._update_lateral(state, post_activation)
                 if self.config.use_theta:
-                    self._update_theta(state, i)
+                    self._update_theta(state)
                 self._update_firing_rate(state, post_activation)
+
+                # Adaptive echo: adjust per-layer echo_tau based on credit variance
+                if self.config.use_echo and state.credit_variance_ema is not None:
+                    self._adapt_echo_params(state)
 
         # Debug logging
         if self.debug_file is not None and self.sample_counter % self.log_interval == 0:
-            self._write_debug_log(weight_norms_before, weight_layers)
+            self._write_debug_log(weight_norms_before, weight_states)
 
-    def _find_post_activation(self, state_idx: int) -> torch.Tensor:
-        """Find the post-activation output for a weight layer at state_idx."""
-        state = self.layer_states[state_idx]
-        # Look for the activation layer that follows this weight layer
-        for j in range(state_idx + 1, len(self.layer_states)):
-            next_state = self.layer_states[j]
-            if get_layer_kind(next_state.module) == LayerKind.ACTIVATION:
-                return next_state.output_cache
+    def _get_post_activation(self, state: LayerState) -> torch.Tensor:
+        """Get the post-activation output for a weight layer using linked reference."""
+        if state.post_activation_state is not None:
+            return state.post_activation_state.output_cache
         # Fallback to weight layer's output (shouldn't happen in normal networks)
         return state.output_cache
+
+    def _backward_credit_recursive(self, states: List[LayerState], credit: torch.Tensor) -> torch.Tensor:
+        """Backward credit through a list of states, handling nested residual blocks.
+
+        For FX-wired graphs: uses predecessors field for DAG traversal.
+        For tree-wired graphs: uses child_states for residual block handling.
+
+        For residual blocks: credit BRANCHES at block output, MERGES at block input.
+        skip_credit = credit (at block output)
+        deep_credit = credit through children
+        credit_to_input = deep_credit + skip_credit
+        """
+        # Check if we have FX-based predecessors (DAG mode)
+        if hasattr(self, '_node_to_state') and self._node_to_state:
+            return self._backward_credit_dag(credit)
+
+        # Fallback: tree-based traversal with child_states
+        for state in reversed(states):
+            # Check if this is a residual block with children
+            if state.child_states:
+                # Save skip credit (credit at block output, before going through children)
+                skip_credit = credit.clone()
+
+                # Process children recursively (deep path)
+                credit = self._backward_credit_recursive(state.child_states, credit)
+
+                # Merge: add skip credit to credit after children processed
+                credit = credit + skip_credit
+                credit = credit.clamp(-self.config.credit_clip, self.config.credit_clip)
+
+                # Store on block state
+                state.credit = skip_credit  # Block's credit is at its output
+                continue
+
+            # Apply echo for weight layers (adds persistent baseline to credit)
+            if self.config.use_echo and state.eligibility is not None:
+                credit = self._apply_echo(state, credit)
+
+            state.credit = credit
+            credit = self._backward_credit(state, credit)
+            # Clip credit to prevent explosion through deep networks
+            credit = credit.clamp(-self.config.credit_clip, self.config.credit_clip)
+
+        return credit
+
+    def _backward_credit_dag(self, credit: torch.Tensor) -> torch.Tensor:
+        """Backward credit through DAG using predecessors (FX-wired graphs).
+
+        Credit propagates backward from output state through predecessors.
+        At merge points (state with multiple predecessors), credit BRANCHES:
+        the same credit is sent to ALL predecessors.
+        """
+        # Start from output state
+        if not hasattr(self, '_output_state') or self._output_state is None:
+            # Fallback: use last state
+            if self.layer_states:
+                self._output_state = self.layer_states[-1]
+            else:
+                return credit
+
+        # BFS backward through predecessors
+        # Use dict to track credit at each state (handles merge points)
+        state_credit: Dict[int, torch.Tensor] = {}
+        visited = set()
+
+        # Initialize with output state
+        state_credit[id(self._output_state)] = credit
+
+        # Process states in reverse topological order (reverse of layer_states)
+        for state in reversed(self.layer_states):
+            state_id = id(state)
+
+            # Get credit for this state (may have been set by successor)
+            if state_id not in state_credit:
+                continue
+
+            current_credit = state_credit[state_id]
+
+            # Apply echo for weight layers
+            if self.config.use_echo and state.eligibility is not None:
+                current_credit = self._apply_echo(state, current_credit)
+
+            # Store credit on state
+            state.credit = current_credit
+
+            # Backward through this layer
+            upstream_credit = self._backward_credit(state, current_credit)
+            upstream_credit = upstream_credit.clamp(-self.config.credit_clip, self.config.credit_clip)
+
+            # Propagate to predecessors (credit BRANCHES at merge points)
+            if state.predecessors:
+                for pred in state.predecessors:
+                    pred_id = id(pred)
+                    if pred_id in state_credit:
+                        # Merge: add credit from multiple successors
+                        state_credit[pred_id] = state_credit[pred_id] + upstream_credit
+                        state_credit[pred_id] = state_credit[pred_id].clamp(
+                            -self.config.credit_clip, self.config.credit_clip
+                        )
+                    else:
+                        state_credit[pred_id] = upstream_credit
+
+        return credit
+
+    def _apply_echo(self, state: LayerState, credit: torch.Tensor) -> torch.Tensor:
+        """Apply credit echo (dopamine-like persistence) to a weight layer's credit."""
+        # Use per-layer echo params (fall back to config if not set)
+        layer_echo_tau = state.echo_tau if state.echo_tau is not None else self.config.echo_tau_init
+        layer_echo_strength = state.echo_strength if state.echo_strength is not None else self.config.echo_strength_init
+
+        # Batch-average credit, preserving spatial dims for convs
+        # Linear: (batch, features) -> (features,)
+        # Conv: (batch, C, H, W) -> (C, H, W)
+        credit_mean = credit.mean(dim=0)
+
+        # Track credit variance for adaptive echo (before echo boost)
+        credit_var = credit.var(dim=0).mean().item()
+        var_ema_tau = 0.9
+        if state.credit_variance_ema is None:
+            state.credit_variance_ema = credit_var
+        else:
+            state.credit_variance_ema = var_ema_tau * state.credit_variance_ema + (1 - var_ema_tau) * credit_var
+
+        # Lazy init echo on first use (shape matches credit_mean)
+        if state.credit_echo is None:
+            state.credit_echo = torch.zeros_like(credit_mean)
+
+        # STORE credit BEFORE echo boost for A/B comparison
+        state._credit_without_echo = credit.clone()
+
+        # Add PREVIOUS echo to credit BEFORE updating (ease-in: first batch gets no boost)
+        credit = credit + layer_echo_strength * state.credit_echo.unsqueeze(0)
+
+        # STORE credit AFTER echo boost for A/B comparison
+        state._credit_with_echo = credit.clone()
+
+        # Track the echo contribution magnitude
+        state._echo_contribution = (layer_echo_strength * state.credit_echo).norm().item()
+        state._echo_contribution_mean = (layer_echo_strength * state.credit_echo).mean().item()
+
+        # Sign-flip reset: accumulate if same sign, reset if sign flips
+        # But if echo is near-zero (fresh), always accumulate to bootstrap
+        echo_is_fresh = state.credit_echo.abs() < 1e-8
+        sign_match = (credit_mean * state.credit_echo) > 0
+        should_accumulate = sign_match | echo_is_fresh
+        state._echo_reset_frac = (~should_accumulate).float().mean().item()
+
+        state.credit_echo = torch.where(
+            should_accumulate,
+            layer_echo_tau * state.credit_echo + (1 - layer_echo_tau) * credit_mean,
+            torch.zeros_like(state.credit_echo)
+        )
+
+        return credit
 
     def _backward_credit(self, state: LayerState, downstream_credit: torch.Tensor) -> torch.Tensor:
         """Route credit backwards through this layer using dispatch registry."""
@@ -558,7 +893,7 @@ class PropOpWrapper(nn.Module):
         # Fallback: pass through unchanged
         return downstream_credit
 
-    def _apply_hidden_weight_update(self, state: LayerState, hidden_lrs: torch.Tensor, state_idx: int):
+    def _apply_hidden_weight_update(self, state: LayerState, hidden_lrs: torch.Tensor):
         """Compute and apply hidden layer weight update with per-sample learning rates."""
         module = state.module
         credit = state.credit
@@ -566,13 +901,11 @@ class PropOpWrapper(nn.Module):
 
         # For activity gating, we need POST-activation values (after ReLU), not pre-activation
         # The reference uses H1/H2 which are post-ReLU: H1 = np.maximum(0.0, H1_pre)
-        # Find the activation layer that follows this weight layer and use its output
-        post_activation = state.output_cache  # fallback to pre-activation
-        for j in range(state_idx + 1, len(self.layer_states)):
-            next_state = self.layer_states[j]
-            if get_layer_kind(next_state.module) == LayerKind.ACTIVATION:
-                post_activation = next_state.output_cache
-                break
+        # Use linked post_activation_state if available, else fallback to pre-activation
+        if state.post_activation_state is not None:
+            post_activation = state.post_activation_state.output_cache
+        else:
+            post_activation = state.output_cache  # fallback to pre-activation
 
         if isinstance(module, nn.Linear):
             delta = self._compute_linear_update(state, input_data, post_activation, credit, hidden_lrs)
@@ -793,23 +1126,13 @@ class PropOpWrapper(nn.Module):
         state.lateral *= decay
         state.lateral.fill_diagonal_(0.0)
 
-    def _update_theta(self, state: LayerState, state_idx: int):
+    def _update_theta(self, state: LayerState):
         """Update homeostatic thresholds based on post-activation firing."""
         if not self.config.use_theta or state.theta is None:
             return
 
-        # Find the activation layer that follows this weight layer
-        # Use its output_cache (post-ReLU activations) for firing rate
-        post_activation = None
-        for j in range(state_idx + 1, len(self.layer_states)):
-            next_state = self.layer_states[j]
-            if get_layer_kind(next_state.module) == LayerKind.ACTIVATION:
-                post_activation = next_state.output_cache
-                break
-
-        if post_activation is None:
-            # No activation found, use weight layer's output (fallback)
-            post_activation = state.output_cache
+        # Use linked post_activation_state, fallback to weight layer's output
+        post_activation = self._get_post_activation(state)
 
         if post_activation.dim() == 4:
             post_activation = post_activation.mean(dim=(2, 3))
@@ -839,12 +1162,39 @@ class PropOpWrapper(nn.Module):
         tau = self.config.firing_rate_tau ** n
         state.firing_rate = tau * state.firing_rate + (1 - tau) * avg_active
 
-    def _write_debug_log(self, weight_norms_before: dict, weight_layers: list):
+    def _adapt_echo_params(self, state: LayerState):
+        """Adapt per-layer echo params based on credit variance.
+
+        High variance → increase tau (more smoothing) and strength
+        Low variance → decrease tau (more responsive) and strength
+        """
+        if state.echo_tau is None or state.credit_variance_ema is None:
+            return
+
+        # Target variance - if actual variance is higher, increase smoothing
+        target_var = 0.1
+        adapt_lr = 0.01  # Slow adaptation
+
+        var_ratio = state.credit_variance_ema / (target_var + 1e-8)
+
+        # Adapt tau: high variance → higher tau (more smoothing)
+        # var_ratio > 1 means variance is high → nudge tau up
+        # var_ratio < 1 means variance is low → nudge tau down
+        tau_delta = adapt_lr * (var_ratio - 1.0)
+        tau_delta = max(-0.01, min(0.01, tau_delta))  # Clamp adjustment
+        state.echo_tau = max(0.1, min(0.99, state.echo_tau + tau_delta))
+
+        # Adapt strength: high variance → stronger echo contribution
+        strength_delta = adapt_lr * 0.5 * (var_ratio - 1.0)
+        strength_delta = max(-0.005, min(0.005, strength_delta))
+        state.echo_strength = max(0.01, min(0.3, state.echo_strength + strength_delta))
+
+    def _write_debug_log(self, weight_norms_before: dict, weight_states: list):
         """Write debug log entry in format compatible with visualize_debug.py."""
         import json
 
         # Get first hidden layer's cofire for stats
-        hidden_states = [s for _, s in weight_layers[:-1]]  # Exclude output layer
+        hidden_states = weight_states[:-1]  # Exclude output layer
         if not hidden_states:
             return
 
@@ -852,8 +1202,7 @@ class PropOpWrapper(nn.Module):
         cofire = state1.cofire
 
         # Get post-activation for sparsity
-        idx1 = weight_layers[0][0]
-        post_act = self._find_post_activation(idx1)
+        post_act = self._get_post_activation(state1)
         if post_act.dim() == 4:
             post_act = post_act.mean(dim=(2, 3))
         active1 = (post_act > 0).float()
@@ -863,7 +1212,7 @@ class PropOpWrapper(nn.Module):
 
         # Weight norms after
         weight_norms_after = {}
-        for idx, (i, state) in enumerate(weight_layers):
+        for idx, state in enumerate(weight_states):
             weight_norms_after[f'W{idx+1}'] = state.module.weight.data.norm().item()
 
         debug_entry = {
@@ -894,8 +1243,7 @@ class PropOpWrapper(nn.Module):
         if len(hidden_states) > 1:
             state2 = hidden_states[1]
             cofire2 = state2.cofire
-            idx2 = weight_layers[1][0]
-            post_act2 = self._find_post_activation(idx2)
+            post_act2 = self._get_post_activation(state2)
             if post_act2.dim() == 4:
                 post_act2 = post_act2.mean(dim=(2, 3))
             active2 = (post_act2 > 0).float()
@@ -918,6 +1266,44 @@ class PropOpWrapper(nn.Module):
                 debug_entry["lateral2_min"] = state2.lateral.min().item()
                 debug_entry["lateral2_max"] = state2.lateral.max().item()
                 debug_entry["lateral2_mean"] = state2.lateral.mean().item()
+
+        # Echo A/B comparison stats (if echo enabled)
+        if self.config.use_echo:
+            for idx, state in enumerate(weight_states):
+                key = f"echo{idx+1}"
+
+                # Echo state
+                if state.credit_echo is not None:
+                    debug_entry[f"{key}_norm"] = state.credit_echo.norm().item()
+                    debug_entry[f"{key}_mean"] = state.credit_echo.mean().item()
+                    debug_entry[f"{key}_min"] = state.credit_echo.min().item()
+                    debug_entry[f"{key}_max"] = state.credit_echo.max().item()
+
+                # Echo contribution (what echo added to credit)
+                if hasattr(state, '_echo_contribution'):
+                    debug_entry[f"{key}_contrib_norm"] = state._echo_contribution
+                    debug_entry[f"{key}_contrib_mean"] = state._echo_contribution_mean
+
+                # Credit comparison
+                if hasattr(state, '_credit_without_echo') and hasattr(state, '_credit_with_echo'):
+                    debug_entry[f"{key}_credit_without_norm"] = state._credit_without_echo.norm().item()
+                    debug_entry[f"{key}_credit_with_norm"] = state._credit_with_echo.norm().item()
+                    debug_entry[f"{key}_credit_boost_ratio"] = (
+                        state._credit_with_echo.norm().item() /
+                        (state._credit_without_echo.norm().item() + 1e-8)
+                    )
+
+                # Reset fraction
+                if hasattr(state, '_echo_reset_frac'):
+                    debug_entry[f"{key}_reset_frac"] = state._echo_reset_frac
+
+                # Per-layer adaptive echo params
+                if state.echo_tau is not None:
+                    debug_entry[f"{key}_tau"] = state.echo_tau
+                if state.echo_strength is not None:
+                    debug_entry[f"{key}_strength"] = state.echo_strength
+                if state.credit_variance_ema is not None:
+                    debug_entry[f"{key}_credit_var"] = state.credit_variance_ema
 
         self.debug_file.write(json.dumps(debug_entry) + "\n")
         self.debug_file.flush()
@@ -980,12 +1366,15 @@ class PropOpWrapper(nn.Module):
                 "theta_clip": self.config.theta_clip,
                 "target_fire": self.config.target_fire,
                 "firing_rate_tau": self.config.firing_rate_tau,
+                "use_echo": self.config.use_echo,
+                "echo_tau_init": self.config.echo_tau_init,
+                "echo_strength_init": self.config.echo_strength_init,
             },
             "layer_states": [],
         }
 
-        # Save learning state for each weight layer
-        for i, layer_state in enumerate(self.layer_states):
+        # Save learning state for each weight layer (including nested)
+        for i, layer_state in enumerate(self._iter_all_states()):
             if layer_state.eligibility is not None:
                 state["layer_states"].append({
                     "index": i,
@@ -994,6 +1383,7 @@ class PropOpWrapper(nn.Module):
                     "lateral": layer_state.lateral.cpu() if layer_state.lateral is not None else None,
                     "theta": layer_state.theta.cpu() if layer_state.theta is not None else None,
                     "firing_rate": layer_state.firing_rate.cpu() if layer_state.firing_rate is not None else None,
+                    "credit_echo": layer_state.credit_echo.cpu() if layer_state.credit_echo is not None else None,
                 })
 
         return state
@@ -1003,10 +1393,15 @@ class PropOpWrapper(nn.Module):
         # Load model weights
         self.model.load_state_dict(state_dict["model"], strict=strict)
 
+        # Build index -> state mapping for all states (including nested)
+        all_states = list(self._iter_all_states())
+
         # Load learning state for weight layers
         for saved_state in state_dict.get("layer_states", []):
             idx = saved_state["index"]
-            layer_state = self.layer_states[idx]
+            if idx >= len(all_states):
+                continue  # Skip if index out of bounds
+            layer_state = all_states[idx]
 
             if saved_state["eligibility"] is not None:
                 layer_state.eligibility = saved_state["eligibility"].to(self.device)
@@ -1018,3 +1413,5 @@ class PropOpWrapper(nn.Module):
                 layer_state.theta = saved_state["theta"].to(self.device)
             if saved_state["firing_rate"] is not None:
                 layer_state.firing_rate = saved_state["firing_rate"].to(self.device)
+            if saved_state.get("credit_echo") is not None:
+                layer_state.credit_echo = saved_state["credit_echo"].to(self.device)

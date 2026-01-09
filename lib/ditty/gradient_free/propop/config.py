@@ -23,6 +23,11 @@ class PropOpConfig:
     norm_lr: float = 0.01  # Learning rate for gentle norm banding rescaling
     credit_clip: float = 10.0  # Max absolute credit value (like gradient clipping)
 
+    # Credit echo (dopamine-like persistence)
+    use_echo: bool = False  # Enable credit echo
+    echo_tau_init: float = 0.9  # Initial per-layer EMA decay (adapts during training)
+    echo_strength_init: float = 0.5  # Initial per-layer contribution (adapts during training)
+
     # Hyperparameters
     cofire_tau: float = 0.33  # EMA decay for cofire matrix
     lateral_tau: float = 0.33  # EMA decay for lateral inhibition
