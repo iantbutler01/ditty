@@ -20,6 +20,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import DittyBase
+from .grpo import GRPOConfig, compute_grpo_loss
+from .projection import extract_last_hidden_state
+from .projection import materialize_model_tensor
 from .processors import Context
 
 # Optional imports for memory-efficient CE
@@ -34,7 +37,6 @@ try:
     CCE_AVAILABLE = True
 except ImportError:
     CCE_AVAILABLE = False
-
 
 from torch.distributed.fsdp import fully_shard
 
@@ -67,13 +69,29 @@ class LossCalculator(DittyBase, nn.Module, ABC):
             fully_shard(self)
 
     def get_prediction(self, model_output: Tuple[Any, ...]) -> torch.Tensor:
-        return model_output[self.output_index]
+        prediction = model_output[self.output_index]
+        return self._extract_prediction_tensor(prediction)
 
     def get_target(self, ctx: Context) -> torch.Tensor:
         return ctx[self.target_key]
 
     def get_mask(self, ctx: Context) -> Optional[torch.Tensor]:
         return ctx.get(self.mask_key) if self.mask_key else None
+
+    @staticmethod
+    def _extract_prediction_tensor(prediction: Any) -> torch.Tensor:
+        if isinstance(prediction, torch.Tensor):
+            return prediction
+        if hasattr(prediction, "logits") and isinstance(prediction.logits, torch.Tensor):
+            return prediction.logits
+        if isinstance(prediction, dict):
+            logits = prediction.get("logits")
+            if isinstance(logits, torch.Tensor):
+                return logits
+        raise TypeError(
+            "Could not extract prediction tensor from model output. "
+            f"Expected a tensor or an object with `.logits`, got {type(prediction).__name__}."
+        )
 
     @abstractmethod
     def compute(self, model_output: Tuple[Any, ...], ctx: Context) -> LossOutput:
@@ -144,6 +162,49 @@ class CrossEntropyLoss(LossCalculator):
         else:
             loss = F.cross_entropy(pred, target, ignore_index=self.ignore_index)
         return LossOutput(loss=loss, metrics={"ce": loss.item()})
+
+
+class GRPOLoss(LossCalculator):
+    def __init__(
+        self,
+        config: Optional[GRPOConfig] = None,
+        old_logprob_key: str = "old_logprobs",
+        reference_logprob_key: str = "ref_logprobs",
+        advantage_key: str = "advantages",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.config = config or GRPOConfig()
+        self.old_logprob_key = old_logprob_key
+        self.reference_logprob_key = reference_logprob_key
+        self.advantage_key = advantage_key
+
+    def compute(self, model_output: Tuple[Any, ...], ctx: Context) -> LossOutput:
+        labels = self.get_target(ctx)
+        mask = self.get_mask(ctx)
+        if mask is None:
+            mask = labels.ne(-100)
+
+        logits = None
+        hidden_states = None
+        if self.config.logprob_source == "hidden_states":
+            hidden_states = extract_last_hidden_state(model_output[self.output_index])
+        else:
+            logits = self.get_prediction(model_output)
+
+        loss, metrics = compute_grpo_loss(
+            logits=logits,
+            hidden_states=hidden_states,
+            labels=labels,
+            mask=mask,
+            old_logprobs=ctx[self.old_logprob_key],
+            advantages=ctx[self.advantage_key],
+            reference_logprobs=ctx.get(self.reference_logprob_key),
+            config=self.config,
+            model=ctx.get("model"),
+            logits_positions=ctx.get("logits_positions"),
+        )
+        return LossOutput(loss=loss, metrics=metrics)
 
 
 class FusedLinearCrossEntropyLoss(LossCalculator):
@@ -218,38 +279,11 @@ class FusedLinearCrossEntropyLoss(LossCalculator):
         if mask is not None and mask.dim() > 1:
             mask = mask.reshape(-1)
 
-        # Handle torch.compile + FSDP2: compiled forward returns traced tensors with zero storage
-        # Get real weights from the model via _orig_mod if needed
-        from torch.distributed.tensor import DTensor, Replicate
-
-        def get_real_tensor(tensor, model, attr_path):
-            """Get real tensor, handling torch.compile traced tensors and FSDP2 DTensors."""
-            if tensor is None:
-                return None
-            # Check if this is a traced tensor with zero storage (torch.compile artifact)
-            if tensor.untyped_storage().size() == 0:
-                # Get the real model (unwrap torch.compile)
-                real_model = getattr(model, '_orig_mod', model)
-                # Navigate the attribute path to get real weight
-                obj = real_model
-                for attr in attr_path.split('.'):
-                    obj = getattr(obj, attr)
-                tensor = obj
-            # Handle FSDP2 DTensor sharding - use redistribute for differentiable gather
-            if isinstance(tensor, DTensor):
-                # redistribute is differentiable, full_tensor is not
-                tensor = tensor.redistribute(placements=[Replicate()] * tensor.device_mesh.ndim)
-                tensor = tensor.to_local()
-            elif hasattr(tensor, 'data') and isinstance(tensor.data, DTensor):
-                tensor = tensor.data.redistribute(placements=[Replicate()] * tensor.data.device_mesh.ndim)
-                tensor = tensor.to_local()
-            return tensor
-
         model = ctx.get("model")
         if model is not None and self.weight_attr_path:
-            weight = get_real_tensor(weight, model, self.weight_attr_path)
+            weight = materialize_model_tensor(weight, model=model, attr_path=self.weight_attr_path)
             if bias is not None and self.bias_attr_path:
-                bias = get_real_tensor(bias, model, self.bias_attr_path)
+                bias = materialize_model_tensor(bias, model=model, attr_path=self.bias_attr_path)
 
         if self.backend == "liger":
             loss = self._compute_liger(hidden, weight, bias, target, mask)

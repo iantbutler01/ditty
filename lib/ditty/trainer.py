@@ -7,8 +7,9 @@ from .checkpoint import CheckpointManager
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import send_to_device, set_seed
 from transformers.trainer_pt_utils import get_model_param_count
 import atexit
 import contextlib
@@ -22,6 +23,50 @@ def default_scheduler_factory(optimizer):
 
 
 logger = getLogger("ditty_training")
+
+
+def _dist_debug_enabled() -> bool:
+    value = os.environ.get("DITTY_DEBUG_DIST", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _dist_debug(message: str) -> None:
+    if not _dist_debug_enabled():
+        return
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    logger.info(f"[dist-debug rank={rank} local_rank={local_rank}] {message}")
+
+
+def _format_progress_state(
+    *,
+    total_batches: Optional[int],
+    epochs: int,
+    run_start_total_steps: int,
+    state_total_steps: int,
+    time_elapsed: float,
+) -> tuple[float, str, str]:
+    run_batches_done = max(state_total_steps - run_start_total_steps, 0)
+    if total_batches is not None:
+        batches_per_epoch = total_batches // epochs if epochs > 0 else total_batches
+        current_epoch_decimal = run_batches_done / total_batches if total_batches > 0 else 0.0
+        batches_remaining = max(total_batches - run_batches_done, 0)
+        estimated_time_remaining = (
+            (time_elapsed / run_batches_done) * batches_remaining
+            if run_batches_done > 0 else 0
+        )
+        estimated_time_remaining_ddhhmmss = convert_seconds_to_string_time(
+            max(0, estimated_time_remaining)
+        )
+        percent_done = (run_batches_done / total_batches) * 100 if total_batches > 0 else 0.0
+        batch_info = f"Batch {run_batches_done}/{batches_per_epoch}"
+        progress_info = f"{percent_done:.2f}% done | ETA: {estimated_time_remaining_ddhhmmss}"
+        return current_epoch_decimal, batch_info, progress_info
+
+    current_epoch_decimal = run_batches_done / 1000
+    batch_info = f"Batch {run_batches_done}"
+    progress_info = f"elapsed: {convert_seconds_to_string_time(time_elapsed)}"
+    return current_epoch_decimal, batch_info, progress_info
 
 
 @dataclass(kw_only=True)
@@ -103,16 +148,29 @@ class Trainer:
             self.f16_dtype = torch.float16
 
         self.device = self.accelerator.device
+        self._manual_device_placement = False
 
         if self.is_fsdp:
+            dataloader_is_pre_sharded = (
+                hasattr(self.dataset, "sampler") and isinstance(self.dataset.sampler, DistributedSampler)
+            )
             if self.use_scheduler:
-                self.optimizer, self.dataset, self.scheduler = self.accelerator.prepare(
-                    self.optimizer, self.dataset, self.scheduler
-                )
+                if dataloader_is_pre_sharded:
+                    self.optimizer, self.scheduler = self.accelerator.prepare(
+                        self.optimizer, self.scheduler
+                    )
+                else:
+                    self.optimizer, self.dataset, self.scheduler = self.accelerator.prepare(
+                        self.optimizer, self.dataset, self.scheduler
+                    )
             else:
-                self.optimizer, self.dataset = self.accelerator.prepare(
-                    self.optimizer, self.dataset
-                )
+                if dataloader_is_pre_sharded:
+                    self.optimizer = self.accelerator.prepare(self.optimizer)
+                else:
+                    self.optimizer, self.dataset = self.accelerator.prepare(
+                        self.optimizer, self.dataset
+                    )
+            self._manual_device_placement = dataloader_is_pre_sharded
         else:
             if self.use_scheduler:
                 (
@@ -133,6 +191,7 @@ class Trainer:
             self.state = self.initial_state
         else:
             self.state = TrainerState()
+        self._run_start_total_steps = self.state.total_steps
 
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(self.output_dir)
@@ -144,9 +203,29 @@ class Trainer:
         rank = int(os.environ.get("RANK", 0))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+        if self.accelerator.num_processes > 1 and not torch.distributed.is_initialized():
+            _dist_debug(
+                "skipping checkpoint save because the distributed process group is no longer initialized"
+            )
+            return
+
         if self.accelerator.is_main_process:
             logger.info(f"Saving checkpoint at step {self.state.steps} (total: {self.state.total_steps})")
-        self.accelerator.wait_for_everyone()
+        _dist_debug(
+            f"entering _save(checkpoint_num={self._checkpoint_iteration}, "
+            f"step={self.state.steps}, total_steps={self.state.total_steps})"
+        )
+        _dist_debug("waiting for everyone before checkpoint save")
+        try:
+            self.accelerator.wait_for_everyone()
+        except (RuntimeError, ValueError) as error:
+            if rank == 0:
+                logger.warning(
+                    "Skipping checkpoint save because distributed synchronization is unavailable: %s",
+                    error,
+                )
+            return
+        _dist_debug("passed wait_for_everyone before checkpoint save")
 
         self.checkpoint_manager.save(
             checkpoint_num=self._checkpoint_iteration,
@@ -160,6 +239,7 @@ class Trainer:
             rank=rank,
             local_rank=local_rank,
         )
+        _dist_debug(f"checkpoint save completed for checkpoint_num={self._checkpoint_iteration}")
         self._checkpoint_iteration += 1
 
     def _log_pipeline(self):
@@ -192,13 +272,20 @@ class Trainer:
 
         for ep in range(self.state.epoch, epochs):
             dataset = self.dataset
+            _dist_debug(f"starting epoch loop ep={ep}")
 
-            if self.shuffle_each_epoch and hasattr(dataset, 'set_epoch'):
-                dataset.set_epoch(ep)
+            if self.shuffle_each_epoch:
+                if hasattr(dataset, 'set_epoch'):
+                    dataset.set_epoch(ep)
+                elif hasattr(dataset, "sampler") and hasattr(dataset.sampler, "set_epoch"):
+                    dataset.sampler.set_epoch(ep)
 
             for batch in dataset:
                 if batch is None:
                     break
+
+                if self._manual_device_placement:
+                    batch = send_to_device(batch, self.device, non_blocking=True)
 
                 original_batch = batch
                 ctx: Context = {
@@ -237,14 +324,17 @@ class Trainer:
                     if self.max_grad_norm is not None and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
+                    completed_step = self.state.steps + 1
+                    completed_total_steps = self.state.total_steps + 1
+
                     # Log gradients AFTER clip_grad_norm_ to avoid FSDP2 sync issues
                     # clip_grad_norm_ involves all-reduce, so all ranks must finish it first
                     if (self.metrics_logger is not None and
                         hasattr(self.metrics_logger, 'log_gradients') and
                         hasattr(self.metrics_logger, 'gradient_log_every') and
-                        self.state.steps % self.metrics_logger.gradient_log_every == 0 and
+                        completed_step % self.metrics_logger.gradient_log_every == 0 and
                         self.accelerator.is_main_process):
-                        self.metrics_logger.log_gradients(self.model, self.state.steps)
+                        self.metrics_logger.log_gradients(self.model, completed_total_steps)
                     batch_loss = loss.item()
                     self.optimizer.step()
                     if self.use_scheduler and self.scheduler:
@@ -252,27 +342,15 @@ class Trainer:
                     self.optimizer.zero_grad(set_to_none=True)
 
                     time_elapsed = time.time() - start_time
-                    if total_batches is not None:
-                        batches_per_epoch = total_batches // epochs if epochs > 0 else total_batches
-                        total_batches_done = ep * batches_per_epoch + self.state.steps
-                        current_epoch_decimal = total_batches_done / total_batches if total_batches > 0 else 0
-                        batches_remaining = total_batches - total_batches_done
-                        estimated_time_remaining = (
-                            (time_elapsed / total_batches_done) * batches_remaining
-                            if total_batches_done > 0 else 0
-                        )
-                        estimated_time_remaining_ddhhmmss = convert_seconds_to_string_time(
-                            estimated_time_remaining
-                        )
-                        percent_done = (total_batches_done / total_batches) * 100 if total_batches > 0 else 0
-                        batch_info = f"Batch {self.state.steps}/{batches_per_epoch}"
-                        progress_info = f"{percent_done:.2f}% done | ETA: {estimated_time_remaining_ddhhmmss}"
-                    else:
-                        current_epoch_decimal = ep + (self.state.steps / 1000)
-                        batch_info = f"Batch {self.state.steps}"
-                        progress_info = f"elapsed: {convert_seconds_to_string_time(time_elapsed)}"
+                    current_epoch_decimal, batch_info, progress_info = _format_progress_state(
+                        total_batches=total_batches,
+                        epochs=epochs,
+                        run_start_total_steps=self._run_start_total_steps,
+                        state_total_steps=completed_total_steps,
+                        time_elapsed=time_elapsed,
+                    )
 
-                    if self.state.steps % self.log_every == 0 and self.accelerator.is_main_process:
+                    if completed_step % self.log_every == 0 and self.accelerator.is_main_process:
                         metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in loss_output.metrics.items())
                         logger.info(
                             f"Epoch {current_epoch_decimal:.2f} | {batch_info} | "
@@ -281,30 +359,35 @@ class Trainer:
 
                         if self.metrics_logger:
                             for k, v in loss_output.metrics.items():
-                                self.metrics_logger.log_scalar(f"train/{k}", v, self.state.total_steps)
+                                self.metrics_logger.log_scalar(f"train/{k}", v, completed_total_steps)
                             # Log learning rate if supported
                             if hasattr(self.metrics_logger, 'log_lr'):
-                                self.metrics_logger.log_lr(self.optimizer, self.state.total_steps)
+                                self.metrics_logger.log_lr(self.optimizer, completed_total_steps)
                             # Log epoch progress
-                            self.metrics_logger.log_scalar("train/epoch", current_epoch_decimal, self.state.total_steps)
+                            self.metrics_logger.log_scalar("train/epoch", current_epoch_decimal, completed_total_steps)
 
                     self.state.global_loss += batch_loss
 
-                self.state.steps += 1
-                self.state.total_steps += 1
+                self.state.steps = completed_step
+                self.state.total_steps = completed_total_steps
 
                 if max_steps is not None and self.state.total_steps >= max_steps:
                     break
 
                 if self.state.steps % self.checkpoint_every == 0 and self.state.steps > 0:
+                    _dist_debug(f"triggering periodic checkpoint at step={self.state.steps}")
                     self._save()
 
+            _dist_debug(f"epoch {ep} complete, waiting for everyone before epoch increment")
             self.accelerator.wait_for_everyone()
+            _dist_debug(f"epoch {ep} post-wait complete")
             self.state.epoch += 1
             self.state.steps = 0
 
         atexit.unregister(self._save)
+        _dist_debug("training loop complete, invoking final _save()")
         self._save()
+        _dist_debug("final _save() returned")
 
         return self.state.global_loss / self.state.total_steps if self.state.total_steps > 0 else 0
 

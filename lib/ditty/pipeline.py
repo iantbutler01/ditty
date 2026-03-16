@@ -1,15 +1,17 @@
 import logging
+import math
 import os
 import types
 from logging import getLogger
 from typing import Optional, List, Dict, Any, Union, Callable
 import bitsandbytes as bnb
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from datasets import Dataset, IterableDataset
 from .trainer import Trainer, TrainerState
 from .data import Data
@@ -102,6 +104,7 @@ class Pipeline:
         self.shuffle_each_epoch = shuffle_each_epoch
         self.num_workers = num_workers
         self.shuffle_buffer_size = shuffle_buffer_size
+        self._is_iterable_dataset = False
 
         # Checkpoint manager for unified checkpoint handling
         self.checkpoint_manager = CheckpointManager(output_dir)
@@ -122,6 +125,7 @@ class Pipeline:
         rank = int(os.environ.get("RANK", 0))
 
         if isinstance(self._dataset, DataLoader):
+            self._is_iterable_dataset = isinstance(getattr(self._dataset, "dataset", None), IterableDataset)
             try:
                 dataset_size = len(self._dataset.dataset)
                 total_batches = (dataset_size // world_size + self.batch_size - 1) // self.batch_size * self.epochs
@@ -131,15 +135,21 @@ class Pipeline:
             return self._dataset, dataset_size, total_batches
 
         dataset = self._dataset
-        dataset_size = len(dataset)
-        total_batches = (dataset_size // world_size + self.batch_size - 1) // self.batch_size * self.epochs
+        original_dataset_size = len(dataset)
+        global_batch_size = self.batch_size * world_size
 
         if rank == 0:
-            logger.info(f"Dataset: {dataset_size:,} examples, ~{total_batches // self.epochs:,} batches per GPU per epoch")
+            if world_size > 1:
+                estimated_samples_per_rank = math.ceil(original_dataset_size / world_size)
+            else:
+                estimated_samples_per_rank = original_dataset_size
+            estimated_batches = math.ceil(estimated_samples_per_rank / self.batch_size)
+            logger.info(
+                f"Dataset: {original_dataset_size:,} examples, ~{estimated_batches:,} batches per GPU per epoch"
+            )
 
-        # Fast skip for resuming: use select() before converting to iterable
+        # Fast skip for resuming: trim the remaining map-style dataset before sampling.
         if self._trainer_state is not None and self._trainer_state.steps > 0:
-            global_batch_size = self.batch_size * world_size
             skip_samples = self._trainer_state.steps * global_batch_size
             if skip_samples < len(dataset):
                 if rank == 0:
@@ -149,18 +159,55 @@ class Pipeline:
                 if rank == 0:
                     logger.info(f"Skip exceeds dataset size ({skip_samples:,} >= {len(dataset):,}), starting from beginning")
 
-        iterable_dataset = dataset.to_iterable_dataset(num_shards=128)
-        iterable_dataset = iterable_dataset.shuffle(seed=42, buffer_size=self.shuffle_buffer_size)
+        current_dataset_size = len(dataset)
+        if current_dataset_size == 0:
+            dataloader = DataLoader(
+                [],
+                batch_size=self.batch_size,
+                collate_fn=self.collate_fn,
+                num_workers=0,
+                pin_memory=True,
+            )
+            self._is_iterable_dataset = False
+            return dataloader, 0, 0
 
+        self._is_iterable_dataset = False
+        sampler = None
+        shuffle = self.shuffle_each_epoch
+        if world_size > 1:
+            sampler_seed = self.seed if self.seed is not None else 42
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=self.shuffle_each_epoch,
+                seed=sampler_seed,
+                drop_last=False,
+            )
+            padded_samples = len(sampler) * world_size - current_dataset_size
+            if padded_samples > 0 and rank == 0:
+                logger.info(
+                    "DistributedSampler will pad %s sample(s) per epoch so all %s ranks stay aligned.",
+                    padded_samples,
+                    world_size,
+                )
+            samples_per_rank = len(sampler)
+            shuffle = False
+        else:
+            samples_per_rank = current_dataset_size
+
+        total_batches = math.ceil(samples_per_rank / self.batch_size) * self.epochs
         dataloader = DataLoader(
-            iterable_dataset,
+            dataset,
             batch_size=self.batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
             pin_memory=True,
         )
 
-        return dataloader, dataset_size, total_batches
+        return dataloader, current_dataset_size, total_batches
 
     def _validate_contracts(self):
         parse_errors = []
@@ -237,6 +284,20 @@ class Pipeline:
         trainer_state.load_state_dict(checkpoint.training_state)
 
         return checkpoint, trainer_state
+
+    def _discard_incompatible_checkpoint(self, reason: str) -> tuple[None, None]:
+        rank = int(os.environ.get("RANK", 0))
+        if rank == 0:
+            logger.warning(
+                "Discarding resume checkpoint and restarting this run from scratch: %s",
+                reason,
+            )
+
+        self._checkpoint = None
+        self._trainer_state = None
+        self.model_factory._checkpoint_state = None
+        self.dataloader, self.dataset_size, self.total_batches = self._prepare_dataloader()
+        return None, None
 
     def _create_optimizer(self, model: nn.Module, checkpoint: Optional[Checkpoint] = None):
         """Create optimizer and optionally load state from checkpoint."""
@@ -322,7 +383,16 @@ class Pipeline:
                 logger.info("Will load model weights from checkpoint")
 
         # Step 2: Build model (with checkpoint weights if available)
-        self.model = self.model_factory.build()
+        try:
+            self.model = self.model_factory.build()
+        except Exception as error:
+            if checkpoint is not None and checkpoint.model_state is not None:
+                checkpoint, trainer_state = self._discard_incompatible_checkpoint(
+                    f"model checkpoint could not be applied during build: {error}"
+                )
+                self.model = self.model_factory.build()
+            else:
+                raise
 
         if self.gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -335,6 +405,16 @@ class Pipeline:
 
         # Step 3: Create optimizer (and load optimizer state from checkpoint)
         self.optimizer = self._create_optimizer(self.model, checkpoint)
+
+        if checkpoint is not None and checkpoint.distributed_checkpoint_path is not None:
+            model_restore_ok = self.checkpoint_manager.apply_to_model(checkpoint, self.model)
+            if model_restore_ok:
+                self.checkpoint_manager.apply_to_optimizer(checkpoint, self.optimizer, model=self.model)
+            else:
+                checkpoint, trainer_state = self._discard_incompatible_checkpoint(
+                    "distributed model checkpoint schema no longer matches the current model"
+                )
+                self.optimizer = self._create_optimizer(self.model, None)
 
         # Step 4: Load RNG states if resuming
         if checkpoint is not None:
@@ -362,6 +442,17 @@ class Pipeline:
             ),
             "mixed_precision": "bf16" if self.use_bfloat16 else ("fp16" if self.fp16 else "no"),
         }
+        if world_size > 1 and self._is_iterable_dataset and "dataloader_config" not in self.accelerator_kwargs:
+            # Iterable datasets need each rank to fetch its own batches under distributed training.
+            acc_kwargs["dataloader_config"] = DataLoaderConfiguration(
+                dispatch_batches=False,
+                split_batches=False,
+            )
+            if rank == 0:
+                logger.info(
+                    "Using per-rank dataloader fetching for iterable dataset "
+                    "(dispatch_batches=False, split_batches=False)"
+                )
         acc_kwargs.update(self.accelerator_kwargs)
         self.accelerator = Accelerator(**acc_kwargs)
 
@@ -401,24 +492,27 @@ class Pipeline:
             initial_state=trainer_state,
         )
 
-        trainer.train(epochs=self.epochs, max_steps=self.max_steps)
+        try:
+            trainer.train(epochs=self.epochs, max_steps=self.max_steps)
 
-        self.accelerator.wait_for_everyone()
+            self.accelerator.wait_for_everyone()
 
-        if self.push_to_hub_flag:
-            model = self.accelerator.unwrap_model(self.model)
+            if self.push_to_hub_flag:
+                model = self.accelerator.unwrap_model(self.model)
 
-            if self.merge_adapters and hasattr(model, "merge_and_unload"):
-                logger.info("Merging adapters and unloading.")
-                model = model.merge_and_unload(True)
+                if self.merge_adapters and hasattr(model, "merge_and_unload"):
+                    logger.info("Merging adapters and unloading.")
+                    model = model.merge_and_unload(True)
+
+                if self.accelerator.is_main_process:
+                    logger.info("Pushing to hub!")
+
+                model.push_to_hub = types.MethodType(push_to_hub, model)
+                model.push_to_hub(self.output_hub_repo, token=self.hf_hub_token, accelerator=self.accelerator, private=self.private_repo)
 
             if self.accelerator.is_main_process:
-                logger.info("Pushing to hub!")
+                logger.info("Training complete!")
 
-            model.push_to_hub = types.MethodType(push_to_hub, model)
-            model.push_to_hub(self.output_hub_repo, token=self.hf_hub_token, accelerator=self.accelerator, private=self.private_repo)
-
-        if self.accelerator.is_main_process:
-            logger.info("Training complete!")
-
-        return self.model
+            return self.model
+        finally:
+            self.accelerator.end_training()

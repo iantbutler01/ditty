@@ -1,6 +1,7 @@
 import os
 import pickle
 import random
+import re
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Optional, Dict, Any, List
@@ -12,11 +13,52 @@ import torch.nn as nn
 logger = getLogger("ditty_checkpoint")
 
 
+def _dist_debug_enabled() -> bool:
+    value = os.environ.get("DITTY_DEBUG_DIST", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _dist_debug(message: str) -> None:
+    if not _dist_debug_enabled():
+        return
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    logger.info(f"[dist-debug rank={rank} local_rank={local_rank}] {message}")
+
+
+def _should_log_rank_zero_only() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _summarize_checkpoint_error(error: BaseException) -> str:
+    message = str(error).strip()
+    if not message:
+        return type(error).__name__
+
+    patterns = (
+        r"Missing key in checkpoint state_dict: ([^\s]+)",
+        r"Unexpected key in checkpoint state_dict: ([^\s]+)",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, message)
+        for value in reversed(matches):
+            if "{" not in value and "}" not in value:
+                prefix = pattern.split(":")[0].replace("\\", "")
+                return f"{prefix}: {value}"
+
+    for line in message.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return type(error).__name__
+
+
 @dataclass
 class Checkpoint:
     """Container for all checkpoint data."""
     model_state: Optional[Dict[str, Any]] = None
     optimizer_state: Optional[Dict[str, Any]] = None
+    distributed_checkpoint_path: Optional[str] = None
     scheduler_state: Optional[Dict[str, Any]] = None
     training_state: Dict[str, Any] = field(default_factory=dict)
     scaler_state: Optional[Dict[str, Any]] = None
@@ -82,6 +124,8 @@ class CheckpointManager:
         """Save a complete training checkpoint."""
         checkpoint_path = self._get_checkpoint_path(checkpoint_num)
         os.makedirs(checkpoint_path, exist_ok=True)
+        _dist_debug(f"checkpoint save start path={checkpoint_path} is_fsdp={is_fsdp}")
+        distributed_checkpoint_path = os.path.join(checkpoint_path, "distributed")
 
         # Save model weights (full state dict for FSDP)
         model_path = os.path.join(self.output_dir, "dist", "model.pt")
@@ -91,28 +135,35 @@ class CheckpointManager:
         unwrapped_model = getattr(model, '_orig_mod', model)
 
         if is_fsdp:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
-            from torch.distributed.tensor import DTensor
-
-            # For FSDP2 with fully_shard, we need to use get_model_state_dict
             try:
-                from torch.distributed.checkpoint.state_dict import get_model_state_dict
+                from torch.distributed.checkpoint import save as dcp_save
+                from torch.distributed.checkpoint.state_dict import (
+                    get_model_state_dict,
+                )
+                _dist_debug("capturing sharded model state dict via get_model_state_dict")
                 model_state = get_model_state_dict(unwrapped_model)
-                # Convert DTensors to regular tensors for portable checkpoints
-                model_state = {
-                    k: v.full_tensor().cpu() if isinstance(v, DTensor) else v.cpu()
-                    for k, v in model_state.items()
-                }
+                _dist_debug(
+                    f"captured model state dict entries={len(model_state)}"
+                )
             except ImportError:
                 # Fallback for older torch versions
-                model_state = {k: v.cpu() for k, v in unwrapped_model.state_dict().items()}
+                _dist_debug("torch.distributed.checkpoint unavailable, falling back to state_dict()")
+                model_state = {
+                    k: v.cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in unwrapped_model.state_dict().items()
+                }
 
-            if rank == 0:
+            if "dcp_save" in locals():
+                distributed_state = {"model": model_state}
+            elif rank == 0 and model_state:
+                _dist_debug(f"rank0 writing fallback model state to {model_path}")
                 torch.save(model_state, model_path)
+                _dist_debug("rank0 finished writing fallback model state")
         else:
             if rank == 0:
+                _dist_debug(f"rank0 writing non-FSDP model state to {model_path}")
                 torch.save(unwrapped_model.state_dict(), model_path)
+                _dist_debug("rank0 finished writing non-FSDP model state")
 
         # Save optimizer state
         # When using FSDP with loss_calculator params in the optimizer, we need to
@@ -122,8 +173,11 @@ class CheckpointManager:
 
         if is_fsdp:
             try:
-                from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+                from torch.distributed.checkpoint.state_dict import (
+                    get_optimizer_state_dict,
+                )
                 from torch.distributed.tensor import DTensor
+                _dist_debug("preparing optimizer state extraction for FSDP")
 
                 # Get loss_calculator params in order (if any)
                 loss_params = []
@@ -167,7 +221,9 @@ class CheckpointManager:
                     loss_param_ids = {id(p) for p in loss_params}
 
                     if rank == 0:
+                        _dist_debug(f"rank0 writing loss optimizer sidecar to {loss_optim_path}")
                         torch.save(loss_optim_state, loss_optim_path)
+                        _dist_debug("rank0 finished writing loss optimizer sidecar")
 
                     # Temporarily remove loss params from optimizer.param_groups and optimizer.state
                     # so get_optimizer_state_dict doesn't try to map them
@@ -186,7 +242,11 @@ class CheckpointManager:
                             popped_state[p] = optimizer.state.pop(p)
 
                 # Now get model optimizer state
+                _dist_debug("capturing sharded optimizer state dict via get_optimizer_state_dict")
                 optim_state = get_optimizer_state_dict(model, optimizer)
+                _dist_debug(
+                    f"captured optimizer state dict keys={list(optim_state.keys()) if isinstance(optim_state, dict) else type(optim_state)}"
+                )
 
                 # Restore the popped params and state
                 if loss_params:
@@ -195,27 +255,41 @@ class CheckpointManager:
                     for p, state in popped_state.items():
                         optimizer.state[p] = state
             except ImportError:
+                _dist_debug("optimizer distributed checkpoint APIs unavailable, falling back to optimizer.state_dict()")
                 optim_state = optimizer.state_dict()
         else:
             optim_state = optimizer.state_dict()
 
-        if rank == 0:
+        if is_fsdp and "dcp_save" in locals():
+            distributed_state["optimizer"] = optim_state
+            _dist_debug(f"saving distributed model/optimizer state to {distributed_checkpoint_path}")
+            dcp_save(distributed_state, checkpoint_id=distributed_checkpoint_path)
+            _dist_debug("finished saving distributed model/optimizer state")
+        elif rank == 0:
+            _dist_debug(f"rank0 writing optimizer state to {optimizer_path}")
             torch.save(optim_state, optimizer_path)
+            _dist_debug("rank0 finished writing optimizer state")
 
         # Save scheduler state
         if scheduler is not None and rank == 0:
             scheduler_path = os.path.join(checkpoint_path, "scheduler.pt")
+            _dist_debug(f"rank0 writing scheduler state to {scheduler_path}")
             torch.save(scheduler.state_dict(), scheduler_path)
+            _dist_debug("rank0 finished writing scheduler state")
 
         # Save training state
         if rank == 0:
             training_state_path = os.path.join(checkpoint_path, "training_state.pt")
+            _dist_debug(f"rank0 writing training state to {training_state_path}")
             torch.save(training_state, training_state_path)
+            _dist_debug("rank0 finished writing training state")
 
         # Save scaler state
         if scaler is not None and rank == 0:
             scaler_path = os.path.join(checkpoint_path, "scaler.pt")
+            _dist_debug(f"rank0 writing scaler state to {scaler_path}")
             torch.save(scaler.state_dict(), scaler_path)
+            _dist_debug("rank0 finished writing scaler state")
 
         # Save loss calculator state (if it has learnable parameters)
         # Note: full_tensor() is a collective op, so all ranks must call it together
@@ -225,9 +299,11 @@ class CheckpointManager:
                 # Convert DTensors to full tensors for saving
                 from torch.distributed.tensor import DTensor
                 converted_state = {}
+                _dist_debug(f"processing loss calculator state entries={len(loss_state)}")
                 for k, v in loss_state.items():
                     if isinstance(v, DTensor):
                         # full_tensor() is collective - all ranks must call
+                        _dist_debug(f"materializing DTensor loss state entry={k}")
                         converted_state[k] = v.full_tensor().cpu()
                     elif isinstance(v, torch.Tensor):
                         converted_state[k] = v.cpu()
@@ -236,7 +312,9 @@ class CheckpointManager:
                 # Only rank 0 saves to disk
                 if rank == 0:
                     loss_path = os.path.join(checkpoint_path, "loss_state.pt")
+                    _dist_debug(f"rank0 writing loss state to {loss_path}")
                     torch.save(converted_state, loss_path)
+                    _dist_debug("rank0 finished writing loss state")
 
         # Save RNG states for this rank
         rng_state = {
@@ -248,10 +326,13 @@ class CheckpointManager:
             rng_state["cuda"] = torch.cuda.get_rng_state(local_rank)
 
         rng_path = os.path.join(checkpoint_path, f"rng_state_{rank}.pt")
+        _dist_debug(f"writing RNG state to {rng_path}")
         torch.save(rng_state, rng_path)
+        _dist_debug("finished writing RNG state")
 
         if rank == 0:
             logger.info(f"Saved checkpoint to {checkpoint_path}")
+        _dist_debug(f"checkpoint save end path={checkpoint_path}")
 
     def load(self, checkpoint_num: Optional[int] = None) -> Optional[Checkpoint]:
         """
@@ -268,10 +349,13 @@ class CheckpointManager:
             return None
 
         checkpoint = Checkpoint()
+        distributed_checkpoint_path = os.path.join(checkpoint_path, "distributed")
+        if os.path.exists(distributed_checkpoint_path):
+            checkpoint.distributed_checkpoint_path = distributed_checkpoint_path
 
         # Load model weights
         model_path = os.path.join(self.output_dir, "dist", "model.pt")
-        if os.path.exists(model_path):
+        if checkpoint.distributed_checkpoint_path is None and os.path.exists(model_path):
             state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
             # Strip _orig_mod. prefix added by torch.compile
             checkpoint.model_state = {
@@ -280,7 +364,7 @@ class CheckpointManager:
 
         # Load optimizer state
         optimizer_path = os.path.join(checkpoint_path, "optimizer.bin")
-        if os.path.exists(optimizer_path):
+        if checkpoint.distributed_checkpoint_path is None and os.path.exists(optimizer_path):
             checkpoint.optimizer_state = torch.load(optimizer_path, map_location="cpu", weights_only=False)
 
         # Load scheduler state
@@ -361,14 +445,82 @@ class CheckpointManager:
     def get_latest_checkpoint_num(self) -> Optional[int]:
         return self._get_latest_checkpoint_num()
 
-    def apply_to_model(self, checkpoint: Checkpoint, model: nn.Module):
-        """Apply checkpoint model state to a model."""
-        if checkpoint.model_state is not None:
-            model.load_state_dict(checkpoint.model_state)
-            logger.info("Loaded model weights from checkpoint")
+    def apply_to_model(self, checkpoint: Checkpoint, model: nn.Module) -> bool:
+        """Apply checkpoint model state to a model.
 
-    def apply_to_optimizer(self, checkpoint: Checkpoint, optimizer: torch.optim.Optimizer):
+        Returns True if model weights were restored successfully, False if
+        checkpoint contents were incompatible and the caller should continue
+        with a freshly initialized model.
+        """
+        if checkpoint.distributed_checkpoint_path is not None:
+            from torch.distributed.checkpoint import load as dcp_load
+            from torch.distributed.checkpoint.api import CheckpointException
+            from torch.distributed.checkpoint.state_dict import (
+                get_model_state_dict,
+                set_model_state_dict,
+            )
+
+            state_dict = {"model": get_model_state_dict(model)}
+            try:
+                dcp_load(state_dict, checkpoint_id=checkpoint.distributed_checkpoint_path)
+                set_model_state_dict(model, state_dict["model"])
+                logger.info("Loaded sharded model weights from distributed checkpoint")
+                return True
+            except (CheckpointException, RuntimeError) as error:
+                if _should_log_rank_zero_only():
+                    logger.warning(
+                        "Skipping distributed model state restore from %s due to incompatible "
+                        "checkpoint contents (%s). Continuing with a freshly initialized model.",
+                        checkpoint.distributed_checkpoint_path,
+                        _summarize_checkpoint_error(error),
+                    )
+                return False
+        if checkpoint.model_state is not None:
+            try:
+                model.load_state_dict(checkpoint.model_state)
+                logger.info("Loaded model weights from checkpoint")
+                return True
+            except RuntimeError as error:
+                if _should_log_rank_zero_only():
+                    logger.warning(
+                        "Skipping model state restore from checkpoint due to incompatible contents "
+                        "(%s). Continuing with a freshly initialized model.",
+                        _summarize_checkpoint_error(error),
+                    )
+                return False
+        return True
+
+    def apply_to_optimizer(
+        self,
+        checkpoint: Checkpoint,
+        optimizer: torch.optim.Optimizer,
+        model: Optional[nn.Module] = None,
+    ):
         """Apply checkpoint optimizer state to an optimizer."""
+        if checkpoint.distributed_checkpoint_path is not None:
+            if model is None:
+                raise ValueError("model is required to load distributed optimizer state")
+            from torch.distributed.checkpoint import load as dcp_load
+            from torch.distributed.checkpoint.api import CheckpointException
+            from torch.distributed.checkpoint.state_dict import (
+                get_optimizer_state_dict,
+                set_optimizer_state_dict,
+            )
+
+            state_dict = {"optimizer": get_optimizer_state_dict(model, optimizer)}
+            try:
+                dcp_load(state_dict, checkpoint_id=checkpoint.distributed_checkpoint_path)
+                set_optimizer_state_dict(model, optimizer, state_dict["optimizer"])
+                logger.info("Loaded sharded optimizer state from distributed checkpoint")
+            except (CheckpointException, RuntimeError) as error:
+                if _should_log_rank_zero_only():
+                    logger.warning(
+                        "Skipping distributed optimizer state restore from %s due to incompatible "
+                        "checkpoint contents (%s). Continuing with a freshly initialized optimizer.",
+                        checkpoint.distributed_checkpoint_path,
+                        _summarize_checkpoint_error(error),
+                    )
+            return
         if checkpoint.optimizer_state is not None:
             optimizer.load_state_dict(checkpoint.optimizer_state)
             logger.info("Loaded optimizer state from checkpoint")

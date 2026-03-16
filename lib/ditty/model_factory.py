@@ -1,6 +1,7 @@
 import os
 import types
 from dataclasses import dataclass, field
+from importlib import import_module
 from logging import getLogger
 from typing import Optional, List, Type, Dict, Any, Union
 
@@ -25,6 +26,41 @@ class ModelTransform:
     """
     def transform(self, model: nn.Module) -> nn.Module:
         raise NotImplementedError
+
+
+class CausalLMBackboneTransform(ModelTransform):
+    """Patch HF causal LM forward to return backbone outputs instead of dense vocab logits."""
+
+    def transform(self, model: nn.Module) -> nn.Module:
+        original_forward = model.forward
+
+        def backbone_forward(bound_model, *args, **kwargs):
+            decoder = self._resolve_decoder(bound_model)
+            filtered_kwargs = dict(kwargs)
+            filtered_kwargs.pop("labels", None)
+            filtered_kwargs.pop("logits_to_keep", None)
+            filtered_kwargs["return_dict"] = filtered_kwargs.get("return_dict", True)
+            return decoder(*args, **filtered_kwargs)
+
+        model._ditty_original_forward = original_forward
+        model.forward = types.MethodType(backbone_forward, model)
+        return model
+
+    @staticmethod
+    def _resolve_decoder(model: nn.Module) -> nn.Module:
+        if hasattr(model, "get_decoder"):
+            decoder = model.get_decoder()
+            if decoder is not None:
+                return decoder
+        real_model = getattr(model, "_orig_mod", model)
+        base_model_prefix = getattr(real_model, "base_model_prefix", None)
+        if base_model_prefix and hasattr(real_model, base_model_prefix):
+            return getattr(real_model, base_model_prefix)
+        if hasattr(real_model, "model"):
+            return real_model.model
+        raise RuntimeError(
+            f"Could not resolve decoder/backbone module for model {type(real_model).__name__}."
+        )
 
 
 @dataclass
@@ -55,6 +91,14 @@ class PeftConfig:
     lora_dropout: float = 0.1
     target_modules: List[str] = field(default_factory=lambda: ["k_proj", "q_proj", "v_proj", "up_proj", "down_proj", "gate_proj"])
     use_dora: bool = False
+
+
+@dataclass
+class ModelConfig:
+    model_path: str
+    model_class_name: Optional[str] = None
+    text_only: bool = False
+    load_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 class ModelFactory:
@@ -115,19 +159,143 @@ class ModelFactory:
     @classmethod
     def from_huggingface(
         cls,
-        model_path: str,
+        model_path: Union[str, ModelConfig, Dict[str, Any]],
         fsdp_config: Optional[Union[FSDPConfig, Dict[str, Any]]] = None,
         quant_config: Optional[Union[QuantConfig, Dict[str, Any]]] = None,
         peft_config: Optional[Union[PeftConfig, Dict[str, Any]]] = None,
+        model_transform: Optional[ModelTransform] = None,
+        use_compile: bool = False,
+        compile_mode: str = "default",
         **load_kwargs,
     ) -> "ModelFactory":
+        if isinstance(model_path, dict):
+            model_config = ModelConfig(**model_path)
+        elif isinstance(model_path, ModelConfig):
+            model_config = model_path
+        else:
+            model_config = ModelConfig(model_path=model_path)
+
+        merged_load_kwargs = dict(model_config.load_kwargs)
+        merged_load_kwargs.update(load_kwargs)
+
         return cls(
-            model_path=model_path,
-            model_class=AutoModelForCausalLM,
+            model_path=model_config.model_path,
+            model_class=cls._resolve_huggingface_model_class(model_config, merged_load_kwargs),
             fsdp_config=fsdp_config,
             quant_config=quant_config,
             peft_config=peft_config,
+            load_kwargs=merged_load_kwargs,
+            model_transform=model_transform,
+            use_compile=use_compile,
+            compile_mode=compile_mode,
+        )
+
+    @classmethod
+    def _resolve_huggingface_model_class(
+        cls,
+        model_config: ModelConfig,
+        load_kwargs: Dict[str, Any],
+    ) -> Type[nn.Module]:
+        model_class_name = model_config.model_class_name
+        if model_class_name is None and model_config.text_only:
+            model_class_name = cls._infer_text_only_model_class_name(
+                model_path=model_config.model_path,
+                load_kwargs=load_kwargs,
+            )
+        if model_class_name is None:
+            return AutoModelForCausalLM
+        return cls._lookup_huggingface_model_class(
+            model_path=model_config.model_path,
+            model_class_name=model_class_name,
             load_kwargs=load_kwargs,
+        )
+
+    @classmethod
+    def _infer_text_only_model_class_name(
+        cls,
+        *,
+        model_path: str,
+        load_kwargs: Dict[str, Any],
+    ) -> str:
+        cfg = AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=load_kwargs.get("trust_remote_code", False),
+        )
+        architectures = [str(name) for name in (getattr(cfg, "architectures", None) or [])]
+        candidates: List[str] = []
+        for architecture in architectures:
+            if architecture.endswith("ForConditionalGeneration"):
+                candidates.append(
+                    architecture.removesuffix("ForConditionalGeneration") + "ForCausalLM"
+                )
+            elif architecture.endswith("ForCausalLM"):
+                candidates.append(architecture)
+
+        if not candidates:
+            model_type = str(getattr(cfg, "model_type", "")).replace("-", "_")
+            class_stem = "".join(part.capitalize() for part in model_type.split("_") if part)
+            if class_stem:
+                candidates.append(f"{class_stem}ForCausalLM")
+
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                cls._lookup_huggingface_model_class(
+                    model_path=model_path,
+                    model_class_name=candidate,
+                    load_kwargs=load_kwargs,
+                )
+            except LookupError:
+                continue
+            return candidate
+
+        raise RuntimeError(
+            f"Could not resolve a text-only HuggingFace model class for {model_path!r}. "
+            f"Tried candidates: {candidates or ['<none>']}."
+        )
+
+    @classmethod
+    def _lookup_huggingface_model_class(
+        cls,
+        *,
+        model_path: str,
+        model_class_name: str,
+        load_kwargs: Dict[str, Any],
+    ) -> Type[nn.Module]:
+        if "." in model_class_name:
+            module_name, _, class_name = model_class_name.rpartition(".")
+            module = import_module(module_name)
+            resolved = getattr(module, class_name, None)
+            if resolved is None:
+                raise LookupError(
+                    f"Could not resolve HuggingFace model class {model_class_name!r}."
+                )
+            return resolved
+
+        cfg = AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=load_kwargs.get("trust_remote_code", False),
+        )
+        model_type = str(getattr(cfg, "model_type", "")).replace("-", "_")
+        candidate_modules = [
+            f"transformers.models.{model_type}.modeling_{model_type}",
+            "transformers",
+        ]
+        for module_name in candidate_modules:
+            try:
+                module = import_module(module_name)
+            except ImportError:
+                continue
+            resolved = getattr(module, model_class_name, None)
+            if resolved is not None:
+                return resolved
+
+        raise LookupError(
+            f"Could not resolve HuggingFace model class {model_class_name!r} "
+            f"for model {model_path!r}."
         )
 
     @classmethod
@@ -294,7 +462,13 @@ class ModelFactory:
             logger.info(f"Loading 4bit quantized model: {self._model_path}")
             return self._load_quantized_model()
 
-        if self._model_class == AutoModelForCausalLM:
+        if (
+            self._model_path is not None
+            and not self._model_path.endswith(".pt")
+            and not self._model_path.endswith(".pth")
+            and self._model_class is not None
+            and hasattr(self._model_class, "from_pretrained")
+        ):
             logger.info(f"Loading model from HuggingFace: {self._model_path}")
             bnb_config = None
             if self.quant_config.enabled:
@@ -309,7 +483,7 @@ class ModelFactory:
                 elif self.quant_config.bits == 8:
                     bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
-            return AutoModelForCausalLM.from_pretrained(
+            return self._model_class.from_pretrained(
                 self._model_path,
                 quantization_config=bnb_config,
                 **self._load_kwargs,
