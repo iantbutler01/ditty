@@ -40,10 +40,16 @@ from .grpo import (
 from .grpo_rollouts import (
     GRPORolloutPreProcessor,
     RolloutRecord,
+    StaticGRPORolloutPreProcessor,
     collate_rollouts,
+    coerce_rollout_record,
     compute_old_logprobs,
+    flatten_rollout_records,
     generate_rollouts,
+    prepare_rollout_training_context,
     reward_summary,
+    rollout_record_from_dict,
+    rollout_record_to_dict,
 )
 from . import optimizers
 
@@ -91,9 +97,15 @@ __all__ = [
     "prepare_grpo_forward_kwargs",
     "GRPORolloutPreProcessor",
     "RolloutRecord",
+    "StaticGRPORolloutPreProcessor",
     "collate_rollouts",
+    "coerce_rollout_record",
     "compute_old_logprobs",
+    "flatten_rollout_records",
     "generate_rollouts",
+    "prepare_rollout_training_context",
     "reward_summary",
+    "rollout_record_from_dict",
+    "rollout_record_to_dict",
     "optimizers",
 ]

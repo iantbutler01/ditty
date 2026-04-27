@@ -116,6 +116,7 @@ class Trainer:
     use_bfloat16: bool = False
     output_dir: str = "./output"
     checkpoint_every: int = 1000
+    save_final_checkpoint: bool = True
     hf_hub_token: Optional[str] = None
     seed: Optional[int] = None
     metrics_logger: Optional[Any] = None
@@ -374,7 +375,7 @@ class Trainer:
                 if max_steps is not None and self.state.total_steps >= max_steps:
                     break
 
-                if self.state.steps % self.checkpoint_every == 0 and self.state.steps > 0:
+                if self.checkpoint_every > 0 and self.state.steps % self.checkpoint_every == 0:
                     _dist_debug(f"triggering periodic checkpoint at step={self.state.steps}")
                     self._save()
 
@@ -385,9 +386,13 @@ class Trainer:
             self.state.steps = 0
 
         atexit.unregister(self._save)
-        _dist_debug("training loop complete, invoking final _save()")
-        self._save()
-        _dist_debug("final _save() returned")
+        if self.save_final_checkpoint:
+            _dist_debug("training loop complete, invoking final _save()")
+            self._save()
+            _dist_debug("final _save() returned")
+        else:
+            _dist_debug("training loop complete, final checkpoint disabled")
+            self.accelerator.wait_for_everyone()
 
         return self.state.global_loss / self.state.total_steps if self.state.total_steps > 0 else 0
 

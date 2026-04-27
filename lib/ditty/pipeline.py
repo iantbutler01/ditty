@@ -46,6 +46,7 @@ class Pipeline:
         grad_accum: int = 1,
         checkpoint_every: int = 1000,
         load_checkpoint: bool = True,
+        save_final_checkpoint: bool = True,
         gradient_checkpointing: bool = True,
         use_8bit_optim: bool = False,
         optim_backend: str = "torchao",  # "torch", "bnb", or "torchao"
@@ -85,6 +86,7 @@ class Pipeline:
         self.grad_accum = grad_accum
         self.checkpoint_every = checkpoint_every
         self.load_checkpoint = load_checkpoint
+        self.save_final_checkpoint = save_final_checkpoint
         self.gradient_checkpointing = gradient_checkpointing
         self.use_8bit_optim = use_8bit_optim
         self.optim_backend = optim_backend
@@ -486,6 +488,7 @@ class Pipeline:
             use_bfloat16=self.use_bfloat16,
             output_dir=self.output_dir,
             checkpoint_every=self.checkpoint_every,
+            save_final_checkpoint=self.save_final_checkpoint,
             seed=self.seed,
             use_scheduler=False,
             metrics_logger=self.metrics_logger,

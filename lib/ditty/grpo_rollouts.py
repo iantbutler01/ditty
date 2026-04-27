@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -89,6 +89,74 @@ def _coerce_reward(result: Any) -> tuple[float, dict[str, float]]:
     if hasattr(result, "reward"):
         return float(result.reward), dict(getattr(result, "metrics", {}) or {})
     return float(result), {}
+
+
+def rollout_record_to_dict(record: RolloutRecord) -> dict[str, Any]:
+    return {
+        "task": record.task,
+        "group_id": record.group_id,
+        "sample_id": record.sample_id,
+        "prompt_text": record.prompt_text,
+        "prompt_ids": list(record.prompt_ids),
+        "completion_ids": list(record.completion_ids),
+        "completion_text": record.completion_text,
+        "reward": float(record.reward),
+        "reward_metrics": dict(record.reward_metrics or {}),
+    }
+
+
+def rollout_record_from_dict(row: Mapping[str, Any]) -> RolloutRecord:
+    missing = [
+        key
+        for key in (
+            "task",
+            "group_id",
+            "sample_id",
+            "prompt_text",
+            "prompt_ids",
+            "completion_ids",
+            "completion_text",
+            "reward",
+        )
+        if key not in row
+    ]
+    if missing:
+        raise ValueError(f"Rollout row is missing required field(s): {', '.join(missing)}")
+
+    return RolloutRecord(
+        task=row["task"],
+        group_id=str(row["group_id"]),
+        sample_id=str(row["sample_id"]),
+        prompt_text=str(row["prompt_text"]),
+        prompt_ids=[int(token_id) for token_id in row["prompt_ids"]],
+        completion_ids=[int(token_id) for token_id in row["completion_ids"]],
+        completion_text=str(row["completion_text"]),
+        reward=float(row["reward"]),
+        reward_metrics=dict(row.get("reward_metrics") or {}),
+    )
+
+
+def coerce_rollout_record(value: Any) -> RolloutRecord:
+    if isinstance(value, RolloutRecord):
+        return value
+    if isinstance(value, Mapping):
+        return rollout_record_from_dict(value)
+    raise TypeError(f"Expected RolloutRecord or mapping, got {type(value).__name__}.")
+
+
+def flatten_rollout_records(batch: Any) -> list[RolloutRecord]:
+    if isinstance(batch, RolloutRecord):
+        return [batch]
+    if isinstance(batch, Mapping):
+        if "records" in batch:
+            return flatten_rollout_records(batch["records"])
+        return [rollout_record_from_dict(batch)]
+    if isinstance(batch, Sequence) and not isinstance(batch, (str, bytes, bytearray)):
+        records: list[RolloutRecord] = []
+        for item in batch:
+            records.extend(flatten_rollout_records(item))
+        return records
+    raise TypeError(f"Could not interpret rollout batch of type {type(batch).__name__}.")
 
 
 def _trim_completion(ids: list[int], eos_token_id: int | None) -> list[int]:
@@ -418,6 +486,47 @@ def compute_old_logprobs(model, batch: dict[str, Any], config: GRPOConfig) -> to
     return full_logprobs
 
 
+def prepare_rollout_training_context(
+    *,
+    model,
+    tokenizer,
+    records: Sequence[RolloutRecord],
+    device: torch.device,
+    grpo_config: GRPOConfig,
+    ctx: Context,
+    progress_fn: ProgressFn | None = None,
+    step: int | None = None,
+) -> torch.Tensor:
+    grpo_batch = collate_rollouts(records, tokenizer, device)
+    if progress_fn:
+        step_prefix = f"step {step} " if step is not None else ""
+        progress_fn(f"{step_prefix}old_logprobs start")
+    old_logprobs = compute_old_logprobs(model, grpo_batch, grpo_config)
+    if progress_fn:
+        step_prefix = f"step {step} " if step is not None else ""
+        progress_fn(f"{step_prefix}old_logprobs done")
+    model.train()
+
+    forward_kwargs, logits_positions = prepare_grpo_forward_kwargs(
+        model=model,
+        attention_mask=grpo_batch["attention_mask"],
+        labels=grpo_batch["labels"],
+        mask=grpo_batch["completion_mask"],
+    )
+    ctx["forward_kwargs"] = forward_kwargs
+    ctx["logits_positions"] = logits_positions
+    ctx["target"] = grpo_batch["labels"]
+    ctx["mask"] = grpo_batch["completion_mask"]
+    ctx["old_logprobs"] = old_logprobs
+    ctx["advantages"] = grpo_batch["advantages"]
+    ctx["rollout_records"] = list(records)
+    ctx["rollout_metrics"] = {
+        "advantage_abs_sum": float(grpo_batch["advantages"].abs().sum().item()),
+        **reward_summary(records),
+    }
+    return grpo_batch["input_ids"]
+
+
 class GRPORolloutPreProcessor(PreProcessor):
     def __init__(
         self,
@@ -490,35 +599,20 @@ class GRPORolloutPreProcessor(PreProcessor):
                 f"step {step} rollout done records={len(records)} elapsed={time.time() - step_start:.1f}s"
             )
 
-        grpo_batch = collate_rollouts(records, self.tokenizer, device)
-        if self.progress_fn:
-            self.progress_fn(f"step {step} old_logprobs start")
-        old_logprobs = compute_old_logprobs(model, grpo_batch, self.grpo_config)
-        if self.progress_fn:
-            self.progress_fn(f"step {step} old_logprobs done")
-        model.train()
-
-        forward_kwargs, logits_positions = prepare_grpo_forward_kwargs(
+        input_ids = prepare_rollout_training_context(
             model=model,
-            attention_mask=grpo_batch["attention_mask"],
-            labels=grpo_batch["labels"],
-            mask=grpo_batch["completion_mask"],
+            tokenizer=self.tokenizer,
+            records=records,
+            device=device,
+            grpo_config=self.grpo_config,
+            ctx=ctx,
+            progress_fn=self.progress_fn,
+            step=step,
         )
-        ctx["forward_kwargs"] = forward_kwargs
-        ctx["logits_positions"] = logits_positions
-        ctx["target"] = grpo_batch["labels"]
-        ctx["mask"] = grpo_batch["completion_mask"]
-        ctx["old_logprobs"] = old_logprobs
-        ctx["advantages"] = grpo_batch["advantages"]
-        ctx["rollout_records"] = records
-        ctx["rollout_metrics"] = {
-            "advantage_abs_sum": float(grpo_batch["advantages"].abs().sum().item()),
-            **reward_summary(records),
-        }
         if self.on_rollouts:
             self.on_rollouts(records, ctx["rollout_metrics"], ctx)
 
-        return grpo_batch["input_ids"], ctx
+        return input_ids, ctx
 
     def config(self) -> dict[str, Any]:
         return {
@@ -529,3 +623,50 @@ class GRPORolloutPreProcessor(PreProcessor):
             "rollout_backend": self.rollout_backend,
             "rollout_token_log_every": self.rollout_token_log_every,
         }
+
+
+class StaticGRPORolloutPreProcessor(PreProcessor):
+    def __init__(
+        self,
+        *,
+        tokenizer,
+        grpo_config: GRPOConfig | None = None,
+        progress_fn: ProgressFn | None = None,
+        on_rollouts: RolloutCallback | None = None,
+    ) -> None:
+        super().__init__(contract="")
+        self.tokenizer = tokenizer
+        self.grpo_config = grpo_config or GRPOConfig()
+        self.progress_fn = progress_fn
+        self.on_rollouts = on_rollouts
+
+    def process(self, batch: Any, ctx: Context) -> tuple[torch.Tensor, Context]:
+        model = ctx["model"]
+        device = ctx["device"]
+        step = int(ctx.get("total_steps", 0))
+        records = flatten_rollout_records(batch)
+        if not records:
+            raise ValueError("Static GRPO batch contained no rollout records.")
+
+        if self.progress_fn:
+            group_count = len({record.group_id for record in records})
+            self.progress_fn(
+                f"step {step} static rollouts records={len(records)} groups={group_count}"
+            )
+
+        input_ids = prepare_rollout_training_context(
+            model=model,
+            tokenizer=self.tokenizer,
+            records=records,
+            device=device,
+            grpo_config=self.grpo_config,
+            ctx=ctx,
+            progress_fn=self.progress_fn,
+            step=step,
+        )
+        if self.on_rollouts:
+            self.on_rollouts(records, ctx["rollout_metrics"], ctx)
+        return input_ids, ctx
+
+    def config(self) -> dict[str, Any]:
+        return {"mode": "static"}
