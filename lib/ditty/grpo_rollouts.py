@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.nn as nn
 
 from .grpo import (
     GRPOConfig,
@@ -35,40 +36,48 @@ ProgressFn = Callable[[str], None]
 RolloutCallback = Callable[[list[RolloutRecord], dict[str, float], Context], None]
 
 
-def _call_if_present(model: Any, method_name: str) -> None:
+def _iter_module_tree(model: Any):
     seen: set[int] = set()
-    stack = [model]
+    stack: list[Any] = [model]
     while stack:
         current = stack.pop()
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
+        yield current
+        if isinstance(current, nn.Module):
+            stack.extend(current.children())
+            continue
+        for attr in ("module", "_orig_mod", "_fsdp_wrapped_module", "model", "base_model"):
+            child = getattr(current, attr, None)
+            if child is not current:
+                stack.append(child)
+
+
+def _call_if_present(model: Any, method_name: str) -> bool:
+    called = False
+    for current in _iter_module_tree(model):
         method = getattr(current, method_name, None)
         if callable(method):
             method()
-            return
-        for attr in ("module", "_orig_mod", "model"):
-            child = getattr(current, attr, None)
-            if child is not current:
-                stack.append(child)
+            called = True
+    return called
 
 
 def _is_gradient_checkpointing_enabled(model: Any) -> bool:
-    seen: set[int] = set()
-    stack = [model]
-    while stack:
-        current = stack.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
+    for current in _iter_module_tree(model):
         value = getattr(current, "is_gradient_checkpointing", None)
         if isinstance(value, bool):
             return value
-        for attr in ("module", "_orig_mod", "model"):
-            child = getattr(current, attr, None)
-            if child is not current:
-                stack.append(child)
     return False
+
+
+def _find_model_config(model: Any) -> Any | None:
+    for current in _iter_module_tree(model):
+        config = getattr(current, "config", None)
+        if config is not None and hasattr(config, "use_cache"):
+            return config
+    return None
 
 
 def _coerce_reward(result: Any) -> tuple[float, dict[str, float]]:
@@ -210,13 +219,21 @@ def generate_rollouts(
     model.eval()
     records: list[RolloutRecord] = []
 
-    model_config = getattr(model, "config", None)
+    model_config = _find_model_config(model)
     old_use_cache = getattr(model_config, "use_cache", None) if model_config is not None else None
     old_gradient_checkpointing = _is_gradient_checkpointing_enabled(model)
     if old_use_cache is not None and model_config is not None:
         model_config.use_cache = rollout_use_cache if rollout_backend == "hf_generate" else False
+    disabled_gradient_checkpointing = False
     if rollout_backend == "hf_generate" and rollout_use_cache and old_gradient_checkpointing:
-        _call_if_present(model, "gradient_checkpointing_disable")
+        disabled_gradient_checkpointing = _call_if_present(model, "gradient_checkpointing_disable")
+    if rollout_backend == "hf_generate" and progress_fn:
+        progress_fn(
+            "rollout hf_generate setup "
+            f"use_cache={getattr(model_config, 'use_cache', None)} "
+            f"gradient_checkpointing_was_enabled={old_gradient_checkpointing} "
+            f"disabled_gradient_checkpointing={disabled_gradient_checkpointing}"
+        )
     try:
         for group_offset, task in enumerate(tasks):
             group_id = group_id_fn(task)
