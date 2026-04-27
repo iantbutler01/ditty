@@ -272,7 +272,7 @@ def generate_rollouts(
     reward_fn: RewardFn,
     group_id_fn: Callable[[Any], str],
     rollouts_per_prompt: int,
-    max_new_tokens: int,
+    max_new_tokens: int | Callable[[Any], int],
     temperature: float,
     top_p: float,
     device: torch.device,
@@ -305,6 +305,7 @@ def generate_rollouts(
     try:
         for group_offset, task in enumerate(tasks):
             group_id = group_id_fn(task)
+            task_max_new_tokens = int(max_new_tokens(task) if callable(max_new_tokens) else max_new_tokens)
             should_log = (
                 progress_fn is not None
                 and rollout_log_every > 0
@@ -316,7 +317,10 @@ def generate_rollouts(
             )
             group_start = time.time()
             if should_log:
-                progress_fn(f"rollout task {group_offset + 1}/{len(tasks)} start id={group_id}")
+                progress_fn(
+                    f"rollout task {group_offset + 1}/{len(tasks)} start "
+                    f"id={group_id} max_new_tokens={task_max_new_tokens}"
+                )
 
             prompt_text = render_prompt(task)
             prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
@@ -336,7 +340,7 @@ def generate_rollouts(
                     model=model,
                     input_ids=encoded["input_ids"],
                     attention_mask=encoded["attention_mask"],
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=task_max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     pad_token_id=pad_token_id,
@@ -344,7 +348,7 @@ def generate_rollouts(
                     progress_fn=(
                         (
                             lambda generated, group_offset=group_offset, group_id=group_id: progress_fn(
-                                f"rollout task {group_offset + 1}/{len(tasks)} tokens_generated={generated}/{max_new_tokens} id={group_id}"
+                                f"rollout task {group_offset + 1}/{len(tasks)} tokens_generated={generated}/{task_max_new_tokens} id={group_id}"
                             )
                         )
                         if should_log and progress_fn is not None
@@ -359,7 +363,7 @@ def generate_rollouts(
                     do_sample=True,
                     temperature=temperature,
                     top_p=top_p,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=task_max_new_tokens,
                     use_cache=rollout_use_cache,
                     disable_compile=rollout_disable_compile,
                     pad_token_id=pad_token_id,
