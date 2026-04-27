@@ -35,6 +35,42 @@ ProgressFn = Callable[[str], None]
 RolloutCallback = Callable[[list[RolloutRecord], dict[str, float], Context], None]
 
 
+def _call_if_present(model: Any, method_name: str) -> None:
+    seen: set[int] = set()
+    stack = [model]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        method = getattr(current, method_name, None)
+        if callable(method):
+            method()
+            return
+        for attr in ("module", "_orig_mod", "model"):
+            child = getattr(current, attr, None)
+            if child is not current:
+                stack.append(child)
+
+
+def _is_gradient_checkpointing_enabled(model: Any) -> bool:
+    seen: set[int] = set()
+    stack = [model]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        value = getattr(current, "is_gradient_checkpointing", None)
+        if isinstance(value, bool):
+            return value
+        for attr in ("module", "_orig_mod", "model"):
+            child = getattr(current, attr, None)
+            if child is not current:
+                stack.append(child)
+    return False
+
+
 def _coerce_reward(result: Any) -> tuple[float, dict[str, float]]:
     if isinstance(result, tuple):
         reward, metrics = result
@@ -176,8 +212,11 @@ def generate_rollouts(
 
     model_config = getattr(model, "config", None)
     old_use_cache = getattr(model_config, "use_cache", None) if model_config is not None else None
+    old_gradient_checkpointing = _is_gradient_checkpointing_enabled(model)
     if old_use_cache is not None and model_config is not None:
         model_config.use_cache = rollout_use_cache if rollout_backend == "hf_generate" else False
+    if rollout_backend == "hf_generate" and rollout_use_cache and old_gradient_checkpointing:
+        _call_if_present(model, "gradient_checkpointing_disable")
     try:
         for group_offset, task in enumerate(tasks):
             group_id = group_id_fn(task)
@@ -274,6 +313,8 @@ def generate_rollouts(
                 )
         return records
     finally:
+        if rollout_backend == "hf_generate" and old_gradient_checkpointing:
+            _call_if_present(model, "gradient_checkpointing_enable")
         if old_use_cache is not None and model_config is not None:
             model_config.use_cache = old_use_cache
 

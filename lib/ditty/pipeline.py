@@ -57,6 +57,7 @@ class Pipeline:
         log_every: int = 10,
         metrics_logger: Optional[Any] = None,
         accelerator_kwargs: Dict[str, Any] = {},
+        accelerator_mixed_precision: Optional[str] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         # Hub options
         push_to_hub: bool = False,
@@ -95,6 +96,7 @@ class Pipeline:
         self.log_every = log_every
         self.metrics_logger = metrics_logger
         self.accelerator_kwargs = accelerator_kwargs
+        self.accelerator_mixed_precision = accelerator_mixed_precision
         self._user_optimizer = optimizer
         self.push_to_hub_flag = push_to_hub
         self.output_hub_repo = output_hub_repo
@@ -432,6 +434,10 @@ class Pipeline:
                 logger.info(f"Resuming from epoch {trainer_state.epoch}, step {trainer_state.steps}, total_steps {trainer_state.total_steps}")
 
         # Step 5: Create accelerator
+        mixed_precision = self.accelerator_mixed_precision
+        if mixed_precision is None:
+            mixed_precision = "bf16" if self.use_bfloat16 else ("fp16" if self.fp16 else "no")
+
         acc_kwargs = {
             "gradient_accumulation_steps": self.grad_accum,
             "project_dir": self.output_dir,
@@ -440,7 +446,7 @@ class Pipeline:
                 automatic_checkpoint_naming=True,
                 save_on_each_node=True,
             ),
-            "mixed_precision": "bf16" if self.use_bfloat16 else ("fp16" if self.fp16 else "no"),
+            "mixed_precision": mixed_precision,
         }
         if world_size > 1 and self._is_iterable_dataset and "dataloader_config" not in self.accelerator_kwargs:
             # Iterable datasets need each rank to fetch its own batches under distributed training.
