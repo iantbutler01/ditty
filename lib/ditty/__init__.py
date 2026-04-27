@@ -37,6 +37,14 @@ from .grpo import (
     model_supports_selective_logits,
     prepare_grpo_forward_kwargs,
 )
+from .grpo_rollouts import (
+    GRPORolloutPreProcessor,
+    RolloutRecord,
+    collate_rollouts,
+    compute_old_logprobs,
+    generate_rollouts,
+    reward_summary,
+)
 from . import optimizers
 
 __all__ = [
@@ -81,5 +89,11 @@ __all__ = [
     "compute_group_advantages",
     "model_supports_selective_logits",
     "prepare_grpo_forward_kwargs",
+    "GRPORolloutPreProcessor",
+    "RolloutRecord",
+    "collate_rollouts",
+    "compute_old_logprobs",
+    "generate_rollouts",
+    "reward_summary",
     "optimizers",
 ]
