@@ -188,8 +188,8 @@ def gather_completion_logprobs(
         chunk_selected = flat_selected.index_select(0, chunk_indices)
         values.append(chunk_selected - torch.logsumexp(chunk_logits, dim=-1))
 
-    valid_values = torch.cat(values, dim=0)
     flat_output = torch.zeros_like(flat_selected)
+    valid_values = torch.cat(values, dim=0).to(dtype=flat_output.dtype)
     flat_output.scatter_(0, valid_indices, valid_values)
     return flat_output.view_as(selected_logits)
 
