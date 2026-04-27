@@ -87,6 +87,8 @@ def _manual_generate_completion_ids(
     top_p: float,
     pad_token_id: int,
     eos_token_id: int | None,
+    progress_fn: Callable[[int], None] | None = None,
+    progress_every: int = 0,
 ) -> list[list[int]]:
     batch_size = input_ids.shape[0]
     completions: list[list[int]] = [[] for _ in range(batch_size)]
@@ -94,7 +96,7 @@ def _manual_generate_completion_ids(
     current_ids = input_ids
     current_mask = attention_mask
 
-    for _ in range(max_new_tokens):
+    for token_idx in range(max_new_tokens):
         output = model(input_ids=current_ids, attention_mask=current_mask)
         next_tokens = _sample_next_tokens(output.logits[:, -1, :], temperature=temperature, top_p=top_p)
         active = ~finished
@@ -115,6 +117,9 @@ def _manual_generate_completion_ids(
         )
         current_ids = torch.cat([current_ids, next_tokens.unsqueeze(1)], dim=1)
         current_mask = torch.cat([current_mask, torch.ones_like(next_tokens).unsqueeze(1)], dim=1)
+        generated = token_idx + 1
+        if progress_fn and progress_every > 0 and (generated % progress_every == 0 or generated == max_new_tokens):
+            progress_fn(generated)
 
     return [_trim_completion(ids, eos_token_id) for ids in completions]
 
@@ -163,6 +168,7 @@ def generate_rollouts(
     rollout_disable_compile: bool = True,
     rollout_backend: str = "manual",
     rollout_log_every: int = 1,
+    rollout_token_log_every: int = 16,
     progress_fn: ProgressFn | None = None,
 ) -> list[RolloutRecord]:
     model.eval()
@@ -211,6 +217,16 @@ def generate_rollouts(
                     top_p=top_p,
                     pad_token_id=pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
+                    progress_fn=(
+                        (
+                            lambda generated, group_offset=group_offset, group_id=group_id: progress_fn(
+                                f"rollout task {group_offset + 1}/{len(tasks)} tokens_generated={generated}/{max_new_tokens} id={group_id}"
+                            )
+                        )
+                        if should_log and progress_fn is not None
+                        else None
+                    ),
+                    progress_every=rollout_token_log_every,
                 )
             elif rollout_backend == "hf_generate":
                 input_width = encoded["input_ids"].shape[1]
@@ -361,6 +377,7 @@ class GRPORolloutPreProcessor(PreProcessor):
         rollout_disable_compile: bool = True,
         rollout_backend: str = "manual",
         rollout_log_every: int = 1,
+        rollout_token_log_every: int = 16,
         progress_fn: ProgressFn | None = None,
         on_rollouts: RolloutCallback | None = None,
     ) -> None:
@@ -378,6 +395,7 @@ class GRPORolloutPreProcessor(PreProcessor):
         self.rollout_disable_compile = rollout_disable_compile
         self.rollout_backend = rollout_backend
         self.rollout_log_every = rollout_log_every
+        self.rollout_token_log_every = rollout_token_log_every
         self.progress_fn = progress_fn
         self.on_rollouts = on_rollouts
 
@@ -406,6 +424,7 @@ class GRPORolloutPreProcessor(PreProcessor):
             rollout_disable_compile=self.rollout_disable_compile,
             rollout_backend=self.rollout_backend,
             rollout_log_every=self.rollout_log_every,
+            rollout_token_log_every=self.rollout_token_log_every,
             progress_fn=self.progress_fn,
         )
         if self.progress_fn:
@@ -450,4 +469,5 @@ class GRPORolloutPreProcessor(PreProcessor):
             "rollout_use_cache": self.rollout_use_cache,
             "rollout_disable_compile": self.rollout_disable_compile,
             "rollout_backend": self.rollout_backend,
+            "rollout_token_log_every": self.rollout_token_log_every,
         }
