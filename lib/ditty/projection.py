@@ -6,6 +6,25 @@ import torch
 import torch.nn.functional as F
 
 
+def _replicated_dtensor_from_local(local: torch.Tensor, like: Any) -> torch.Tensor:
+    from torch.distributed.tensor import DTensor, Replicate
+
+    dtensor = like if isinstance(like, DTensor) else getattr(like, "data", None)
+    if not isinstance(dtensor, DTensor):
+        return local
+    placements = [Replicate()] * dtensor.device_mesh.ndim
+    return DTensor.from_local(local, device_mesh=dtensor.device_mesh, placements=placements)
+
+
+def _dtensor_to_local_replicated(value: torch.Tensor) -> torch.Tensor:
+    from torch.distributed.tensor import DTensor, Replicate
+
+    if not isinstance(value, DTensor):
+        return value
+    placements = [Replicate()] * value.device_mesh.ndim
+    return value.redistribute(placements=placements).to_local()
+
+
 def materialize_model_tensor(
     tensor: torch.Tensor | None,
     *,
@@ -129,13 +148,15 @@ def gather_selected_logprobs_from_hidden(
         hidden_chunk = flat_hidden.index_select(0, chunk_indices)
         label_chunk = flat_labels.index_select(0, chunk_indices)
         if output_projection is not None:
-            logits_chunk = output_projection(hidden_chunk)
+            weight = getattr(output_projection, "weight", None)
+            logits_chunk = output_projection(_replicated_dtensor_from_local(hidden_chunk, weight))
+            logits_chunk = _dtensor_to_local_replicated(logits_chunk)
         else:
             if weight is None:
                 raise ValueError("weight is required when output_projection is not provided")
             logits_chunk = F.linear(hidden_chunk, weight, bias)
         selected_chunk = logits_chunk.gather(dim=-1, index=label_chunk.unsqueeze(-1)).squeeze(-1)
         logprob_chunk = selected_chunk - torch.logsumexp(logits_chunk, dim=-1)
-        flat_output.scatter_(0, chunk_indices, logprob_chunk)
+        flat_output.scatter_(0, chunk_indices, logprob_chunk.to(dtype=flat_output.dtype))
 
     return flat_output.view_as(labels)

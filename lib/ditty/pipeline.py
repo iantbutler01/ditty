@@ -1,16 +1,16 @@
 import logging
 import math
 import os
+import shutil
 import types
 from logging import getLogger
 from typing import Optional, List, Dict, Any, Union, Callable
-import bitsandbytes as bnb
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from datasets import Dataset, IterableDataset
 from .trainer import Trainer, TrainerState
@@ -47,16 +47,20 @@ class Pipeline:
         checkpoint_every: int = 1000,
         load_checkpoint: bool = True,
         save_final_checkpoint: bool = True,
+        load_optimizer_checkpoint: bool = True,
         gradient_checkpointing: bool = True,
         use_8bit_optim: bool = False,
-        optim_backend: str = "torchao",  # "torch", "bnb", or "torchao"
+        optim_backend: str = "torchao",  # "torch", "bnb", "torchao", or "adafactor"
         lr: float = 1e-4,
+        scale_lr_by_world_size: bool = True,
         weight_decay: float = 0.01,
         max_grad_norm: float = 1.0,
         epochs: int = 1,
         max_steps: Optional[int] = None,
         log_every: int = 10,
         metrics_logger: Optional[Any] = None,
+        validation_callbacks: Optional[List[Callable[..., Any]]] = None,
+        validation_every: int = 0,
         accelerator_kwargs: Dict[str, Any] = {},
         accelerator_mixed_precision: Optional[str] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
@@ -87,16 +91,20 @@ class Pipeline:
         self.checkpoint_every = checkpoint_every
         self.load_checkpoint = load_checkpoint
         self.save_final_checkpoint = save_final_checkpoint
+        self.load_optimizer_checkpoint = load_optimizer_checkpoint
         self.gradient_checkpointing = gradient_checkpointing
         self.use_8bit_optim = use_8bit_optim
         self.optim_backend = optim_backend
         self.lr = lr
+        self.scale_lr_by_world_size = scale_lr_by_world_size
         self.weight_decay = weight_decay
         self.max_grad_norm = max_grad_norm
         self.epochs = epochs
         self.max_steps = max_steps
         self.log_every = log_every
         self.metrics_logger = metrics_logger
+        self.validation_callbacks = validation_callbacks or []
+        self.validation_every = validation_every
         self.accelerator_kwargs = accelerator_kwargs
         self.accelerator_mixed_precision = accelerator_mixed_precision
         self._user_optimizer = optimizer
@@ -158,7 +166,12 @@ class Pipeline:
             if skip_samples < len(dataset):
                 if rank == 0:
                     logger.info(f"Fast skip: selecting samples {skip_samples:,} to {len(dataset):,} ({len(dataset) - skip_samples:,} remaining)")
-                dataset = dataset.select(range(skip_samples, len(dataset)))
+                if hasattr(dataset, "select"):
+                    dataset = dataset.select(range(skip_samples, len(dataset)))
+                elif isinstance(dataset, (list, tuple)):
+                    dataset = dataset[skip_samples:]
+                else:
+                    dataset = Subset(dataset, range(skip_samples, len(dataset)))
             else:
                 if rank == 0:
                     logger.info(f"Skip exceeds dataset size ({skip_samples:,} >= {len(dataset):,}), starting from beginning")
@@ -303,10 +316,33 @@ class Pipeline:
         self.dataloader, self.dataset_size, self.total_batches = self._prepare_dataloader()
         return None, None
 
+    def _delete_loaded_checkpoint_after_resume(self, checkpoint: Checkpoint | None) -> None:
+        value = os.environ.get("DITTY_DELETE_LOADED_CHECKPOINT_AFTER_RESUME", "")
+        if value.lower() not in {"1", "true", "yes", "on"}:
+            return
+        if checkpoint is None or not checkpoint.path:
+            return
+
+        rank = int(os.environ.get("RANK", 0))
+        if rank == 0:
+            shutil.rmtree(checkpoint.path, ignore_errors=True)
+            logger.info(
+                "Deleted loaded local resume checkpoint after restore: %s",
+                checkpoint.path,
+            )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
     def _create_optimizer(self, model: nn.Module, checkpoint: Optional[Checkpoint] = None):
         """Create optimizer and optionally load state from checkpoint."""
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        lr = self.lr * world_size if world_size > 1 else self.lr
+        lr = self.lr * world_size if self.scale_lr_by_world_size and world_size > 1 else self.lr
+        if world_size > 1 and not self.scale_lr_by_world_size:
+            logger.info(
+                "Using unscaled optimizer lr=%s with world_size=%s",
+                self.lr,
+                world_size,
+            )
         is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
 
         # Collect parameters from model and loss calculator (if it's an nn.Module)
@@ -316,6 +352,13 @@ class Pipeline:
 
         if self._user_optimizer is not None:
             optimizer = self._user_optimizer
+        elif self.optim_backend == "adafactor":
+            optimizer = torch.optim.Adafactor(
+                params,
+                lr=lr,
+                weight_decay=self.weight_decay,
+                foreach=False,
+            )
         elif self.use_8bit_optim:
             if self.optim_backend == "bnb":
                 if is_fsdp:
@@ -329,6 +372,8 @@ class Pipeline:
                         eps=1e-8,
                     )
                 else:
+                    import bitsandbytes as bnb
+
                     optimizer = bnb.optim.Adam8bit(
                         params,
                         lr=lr,
@@ -357,7 +402,7 @@ class Pipeline:
             )
 
         # Load optimizer state from checkpoint if available
-        if checkpoint is not None and checkpoint.optimizer_state is not None:
+        if self.load_optimizer_checkpoint and checkpoint is not None and checkpoint.optimizer_state is not None:
             try:
                 self.checkpoint_manager.apply_to_optimizer(checkpoint, optimizer)
             except Exception as e:
@@ -412,13 +457,16 @@ class Pipeline:
 
         if checkpoint is not None and checkpoint.distributed_checkpoint_path is not None:
             model_restore_ok = self.checkpoint_manager.apply_to_model(checkpoint, self.model)
-            if model_restore_ok:
+            if model_restore_ok and self.load_optimizer_checkpoint:
                 self.checkpoint_manager.apply_to_optimizer(checkpoint, self.optimizer, model=self.model)
             else:
-                checkpoint, trainer_state = self._discard_incompatible_checkpoint(
-                    "distributed model checkpoint schema no longer matches the current model"
-                )
-                self.optimizer = self._create_optimizer(self.model, None)
+                if not model_restore_ok:
+                    checkpoint, trainer_state = self._discard_incompatible_checkpoint(
+                        "distributed model checkpoint schema no longer matches the current model"
+                    )
+                    self.optimizer = self._create_optimizer(self.model, None)
+                elif rank == 0:
+                    logger.info("Skipping optimizer state restore; continuing with a freshly initialized optimizer.")
 
         # Step 4: Load RNG states if resuming
         if checkpoint is not None:
@@ -426,14 +474,17 @@ class Pipeline:
             # Load loss calculator state if available
             if checkpoint.loss_state is not None:
                 self.checkpoint_manager.apply_to_loss_calculator(checkpoint, self.loss_calculator)
+            if checkpoint.preprocessor_states is not None:
+                self.checkpoint_manager.apply_to_preprocessors(checkpoint, self.preprocessors)
             # Load loss optimizer state if available
-            if checkpoint.loss_optimizer_state is not None:
+            if self.load_optimizer_checkpoint and checkpoint.loss_optimizer_state is not None:
                 self.checkpoint_manager.apply_loss_optimizer_state(
                     checkpoint, self.optimizer, self.loss_calculator,
                     is_fsdp=getattr(self.loss_calculator, '_fsdp', False)
                 )
             if rank == 0:
                 logger.info(f"Resuming from epoch {trainer_state.epoch}, step {trainer_state.steps}, total_steps {trainer_state.total_steps}")
+            self._delete_loaded_checkpoint_after_resume(checkpoint)
 
         # Step 5: Create accelerator
         mixed_precision = self.accelerator_mixed_precision
@@ -493,12 +544,15 @@ class Pipeline:
             use_scheduler=False,
             metrics_logger=self.metrics_logger,
             log_every=self.log_every,
+            validation_callbacks=self.validation_callbacks,
+            validation_every=self.validation_every,
             max_grad_norm=self.max_grad_norm,
             hf_hub_token=self.hf_hub_token,
             shuffle_each_epoch=self.shuffle_each_epoch,
             total_batches=self.total_batches,
             is_fsdp=self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False,
             initial_state=trainer_state,
+            initial_checkpoint_num=checkpoint.checkpoint_num if checkpoint is not None else None,
         )
 
         try:

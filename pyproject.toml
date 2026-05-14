@@ -45,6 +45,17 @@ dev = [
     "black",
     "ruff",
 ]
+ray = [
+    "ray[train]",
+]
+gcs = [
+    "gcsfs==2026.2.0",
+    "fsspec==2026.2.0",
+]
+rl = [
+    "ray[train]",
+    "vllm",
+]
 
 [project.urls]
 Homepage = "https://github.com/iantbutler01/ditty"

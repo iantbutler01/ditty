@@ -204,6 +204,9 @@ class GRPOLoss(LossCalculator):
             model=ctx.get("model"),
             logits_positions=ctx.get("logits_positions"),
         )
+        for name, value in dict(ctx.get("rollout_metrics") or {}).items():
+            if isinstance(value, (int, float)):
+                metrics[f"rollout_{name}" if not str(name).startswith("rollout_") else str(name)] = float(value)
         return LossOutput(loss=loss, metrics=metrics)
 
 

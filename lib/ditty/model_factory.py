@@ -8,10 +8,9 @@ from typing import Optional, List, Type, Dict, Any, Union
 import torch
 import torch.nn as nn
 import safetensors
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer, BitsAndBytesConfig
 from transformers.utils import hub, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
-from bitsandbytes.nn import Linear4bit, Params4bit
 from accelerate import init_empty_weights
 from fastcore.parallel import parallel
 from tqdm.auto import tqdm
@@ -69,7 +68,10 @@ class FSDPConfig:
     transformer_layers: List[Type[nn.Module]] = field(default_factory=list)
     param_dtype: Optional[torch.dtype] = None  # e.g. torch.bfloat16
     reduce_dtype: Optional[torch.dtype] = None  # None = match param_dtype, torch.float32 for accuracy
+    original_param_dtype: Optional[torch.dtype] = None  # dtype for sharded optimizer params after fully_shard
     reshard_after_forward: bool = True  # True = FULL_SHARD, False = SHARD_GRAD_OP
+    cpu_offload: bool = False
+    cpu_offload_pin_memory: bool = True
 
 
 @dataclass
@@ -335,6 +337,8 @@ class ModelFactory:
         )
 
     def _replace_linear(self, model: nn.Module, skip_modules: List[str] = None):
+        from bitsandbytes.nn import Linear4bit
+
         skip_modules = skip_modules or ["lm_head"]
         for name, module in model.named_children():
             if name in skip_modules:
@@ -360,6 +364,8 @@ class ModelFactory:
 
     def _load_and_quantize(self, module: nn.Module, name: str, value: torch.Tensor,
                            device=None, dtype=None, skip_names=None, to_cpu=False, to_meta=False):
+        from bitsandbytes.nn import Params4bit
+
         skip_names = skip_names or []
 
         def place_on_device(value):
@@ -534,6 +540,10 @@ class ModelFactory:
         }
         if mp_policy:
             fsdp_kwargs["mp_policy"] = mp_policy
+        if self.fsdp_config.cpu_offload:
+            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(
+                pin_memory=self.fsdp_config.cpu_offload_pin_memory,
+            )
 
         for module in model.modules():
             if any(
@@ -543,9 +553,17 @@ class ModelFactory:
                 fully_shard(module, **fsdp_kwargs)
 
         fully_shard(model, **fsdp_kwargs)
+        if self.fsdp_config.original_param_dtype is not None:
+            logger.info(
+                "Casting FSDP2 sharded original parameters to %s",
+                self.fsdp_config.original_param_dtype,
+            )
+            model.to(self.fsdp_config.original_param_dtype)
         return model
 
     def _setup_quantized_meta_for_peft(self, model: nn.Module):
+        from bitsandbytes.nn import Params4bit
+
         def temp_to_method(self, *args, **kwargs):
             return self
         for param in model.parameters():
@@ -554,6 +572,8 @@ class ModelFactory:
                 param.quant_state.to = types.MethodType(temp_to_method, param.quant_state)
 
     def _setup_quantized_peft_meta_for_training(self, model: nn.Module):
+        from bitsandbytes.nn import Params4bit
+
         for param in model.parameters():
             if isinstance(param, Params4bit) and hasattr(param.quant_state, "_orig_to"):
                 param.quant_state.to = param.quant_state._orig_to

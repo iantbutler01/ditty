@@ -39,8 +39,12 @@ from .grpo import (
 )
 from .grpo_rollouts import (
     GRPORolloutPreProcessor,
+    PolicyVersion,
+    RolloutBatch,
+    RolloutScheduler,
+    RolloutSchedulerConfig,
     RolloutRecord,
-    StaticGRPORolloutPreProcessor,
+    apply_functional_credit_to_records,
     collate_rollouts,
     coerce_rollout_record,
     compute_old_logprobs,
@@ -51,6 +55,20 @@ from .grpo_rollouts import (
     rollout_record_from_dict,
     rollout_record_to_dict,
 )
+from .credit import (
+    FunctionalCreditConfig,
+    assign_functional_token_advantages,
+    structured_action_functional_key,
+)
+from .environments import (
+    DeterministicToolEnvironment,
+    Environment,
+    EnvironmentStepResult,
+    expected_actions,
+    expects_no_tool,
+    replay_tool_environment,
+)
+from .ray_vllm_engine import RayVllmActor, RayVllmRolloutEngine
 from . import optimizers
 
 __all__ = [
@@ -96,8 +114,12 @@ __all__ = [
     "model_supports_selective_logits",
     "prepare_grpo_forward_kwargs",
     "GRPORolloutPreProcessor",
+    "PolicyVersion",
+    "RolloutBatch",
+    "RolloutScheduler",
+    "RolloutSchedulerConfig",
     "RolloutRecord",
-    "StaticGRPORolloutPreProcessor",
+    "apply_functional_credit_to_records",
     "collate_rollouts",
     "coerce_rollout_record",
     "compute_old_logprobs",
@@ -107,5 +129,16 @@ __all__ = [
     "reward_summary",
     "rollout_record_from_dict",
     "rollout_record_to_dict",
+    "FunctionalCreditConfig",
+    "assign_functional_token_advantages",
+    "structured_action_functional_key",
+    "DeterministicToolEnvironment",
+    "Environment",
+    "EnvironmentStepResult",
+    "expected_actions",
+    "expects_no_tool",
+    "replay_tool_environment",
+    "RayVllmActor",
+    "RayVllmRolloutEngine",
     "optimizers",
 ]
