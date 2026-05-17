@@ -81,6 +81,7 @@ class RolloutRecord:
     completion_ids: list[int]
     completion_text: str
     reward: float
+    completion_mask: list[int] | None = None
     reward_metrics: dict[str, float] = field(default_factory=dict)
     token_advantages: list[float] | None = None
     policy_version: PolicyVersion | None = None
@@ -895,6 +896,7 @@ def rollout_record_to_dict(record: RolloutRecord) -> dict[str, Any]:
         "completion_ids": list(record.completion_ids),
         "completion_text": record.completion_text,
         "reward": float(record.reward),
+        "completion_mask": list(record.completion_mask) if record.completion_mask is not None else None,
         "reward_metrics": dict(record.reward_metrics or {}),
         "token_advantages": list(record.token_advantages) if record.token_advantages is not None else None,
         "policy_version": record.policy_version.to_dict() if record.policy_version is not None else None,
@@ -935,6 +937,12 @@ def rollout_record_from_dict(row: Mapping[str, Any]) -> RolloutRecord:
         completion_ids=[int(token_id) for token_id in row["completion_ids"]],
         completion_text=str(row["completion_text"]),
         reward=float(row["reward"]),
+        completion_mask=(
+            [int(value) for value in row["completion_mask"]]
+            if isinstance(row.get("completion_mask"), Sequence)
+            and not isinstance(row.get("completion_mask"), (str, bytes, bytearray))
+            else None
+        ),
         reward_metrics=dict(row.get("reward_metrics") or {}),
         token_advantages=(
             [float(value) for value in row["token_advantages"]]
@@ -980,6 +988,7 @@ def make_no_signal_keepalive_record(
         completion_ids=[keepalive_token_id],
         completion_text="",
         reward=0.0,
+        completion_mask=[1],
         reward_metrics={**dict(record.reward_metrics or {}), "no_signal_keepalive": 1.0},
         token_advantages=[0.0],
         skip_reason="no_signal_keepalive",
@@ -1480,7 +1489,13 @@ def collate_rollouts(
         input_ids[row, :seq_len] = torch.tensor(ids, dtype=torch.long)
         labels[row, :seq_len] = input_ids[row, :seq_len]
         attention_mask[row, :seq_len] = 1
-        completion_mask[row, prompt_len:seq_len] = 1
+        if record.completion_mask is None:
+            completion_mask[row, prompt_len:seq_len] = 1
+        else:
+            values = torch.tensor([bool(int(value)) for value in record.completion_mask], dtype=torch.bool)
+            usable = min(values.numel(), len(record.completion_ids))
+            if usable:
+                completion_mask[row, prompt_len : prompt_len + usable] = values[:usable]
 
     rewards = torch.tensor([r.reward for r in records], dtype=torch.float32)
     group_ids = [r.group_id for r in records]
@@ -1496,12 +1511,15 @@ def collate_rollouts(
         prompt_len = len(record.prompt_ids)
         seq_len = prompt_len + len(record.completion_ids)
         if record.token_advantages is None:
-            token_advantages[row, prompt_len:seq_len] = scalar_advantages[row]
+            token_advantages[row, prompt_len:seq_len] = (
+                completion_mask[row, prompt_len:seq_len].float() * scalar_advantages[row]
+            )
         else:
             values = torch.tensor(record.token_advantages, dtype=torch.float32)
             usable = min(values.numel(), len(record.completion_ids))
             if usable:
                 token_advantages[row, prompt_len : prompt_len + usable] = values[:usable]
+            token_advantages[row, prompt_len:seq_len] *= completion_mask[row, prompt_len:seq_len].float()
 
     batch_payload = {
         "input_ids": input_ids.to(device),

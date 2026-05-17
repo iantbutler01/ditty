@@ -585,6 +585,65 @@ class GRPOCoreTests(unittest.TestCase):
         self.assertEqual(batch["completion_mask"].tolist(), [[False, False, True, True]])
         self.assertEqual(batch["advantages"].tolist(), [[0.0, 0.0, 0.5, -0.25]])
 
+    def test_collate_respects_explicit_completion_mask_for_agent_observations(self) -> None:
+        records = [
+            RolloutRecord(
+                task={},
+                group_id="g0",
+                sample_id="s0",
+                prompt_text="prompt",
+                prompt_ids=[10, 11],
+                completion_ids=[12, 13, 14],
+                completion_text="assistant plus observation",
+                reward=1.0,
+                completion_mask=[1, 0, 1],
+            ),
+            RolloutRecord(
+                task={},
+                group_id="g0",
+                sample_id="s1",
+                prompt_text="prompt",
+                prompt_ids=[10, 11],
+                completion_ids=[12, 13, 14],
+                completion_text="assistant plus observation",
+                reward=0.0,
+                completion_mask=[1, 0, 1],
+            ),
+        ]
+
+        batch = collate_rollouts(records, DummyTokenizer(), torch.device("cpu"), GRPOConfig())
+
+        self.assertEqual(
+            batch["completion_mask"].tolist(),
+            [
+                [False, False, True, False, True],
+                [False, False, True, False, True],
+            ],
+        )
+        self.assertEqual(batch["advantages"][0].tolist()[3], 0.0)
+        self.assertEqual(batch["advantages"][1].tolist()[3], 0.0)
+        self.assertGreater(batch["advantages"][0].tolist()[2], 0.0)
+        self.assertLess(batch["advantages"][1].tolist()[2], 0.0)
+
+    def test_collate_masks_explicit_token_advantages_too(self) -> None:
+        record = RolloutRecord(
+            task={},
+            group_id="g0",
+            sample_id="s0",
+            prompt_text="prompt",
+            prompt_ids=[10],
+            completion_ids=[11, 12, 13],
+            completion_text="answer",
+            reward=1.0,
+            completion_mask=[1, 0, 1],
+            token_advantages=[0.5, 99.0, -0.25],
+        )
+
+        batch = collate_rollouts([record], DummyTokenizer(), torch.device("cpu"), GRPOConfig())
+
+        self.assertEqual(batch["completion_mask"].tolist(), [[False, True, False, True]])
+        self.assertEqual(batch["advantages"].tolist(), [[0.0, 0.5, 0.0, -0.25]])
+
     def test_old_logprobs_microbatch_matches_full_forward(self) -> None:
         labels = torch.tensor(
             [
