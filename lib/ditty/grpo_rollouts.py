@@ -761,6 +761,26 @@ def _task_expected_tokens(task: Any) -> float:
     )
 
 
+def _task_generation_cap(task: Any, max_new_tokens: int | Callable[[Any], int]) -> int:
+    return int(max_new_tokens(task) if callable(max_new_tokens) else max_new_tokens)
+
+
+def sort_tasks_for_generation_batching(
+    tasks: Sequence[Any],
+    max_new_tokens: int | Callable[[Any], int],
+) -> list[Any]:
+    if len(tasks) <= 1:
+        return list(tasks)
+    indexed = list(enumerate(tasks))
+    return [
+        task
+        for _, task in sorted(
+            indexed,
+            key=lambda row: (_task_generation_cap(row[1], max_new_tokens), row[0]),
+        )
+    ]
+
+
 def _iter_module_tree(model: Any):
     seen: set[int] = set()
     stack: list[Any] = [model]
@@ -1895,6 +1915,8 @@ class GRPORolloutPreProcessor(PreProcessor):
                     ctx["oversampled_extra_tasks"] = len(extras)
         elif self.rollout_scheduler is not None and oversample_extra_target > 0:
             ctx["oversampled_extra_tasks"] = max(0, len(input_tasks) - target_batch_size)
+        if self.prompt_batch_size > 1:
+            input_tasks = sort_tasks_for_generation_batching(input_tasks, self.max_new_tokens)
         policy_version = PolicyVersion(
             policy_version=f"step-{step}",
             policy_checkpoint_id=(

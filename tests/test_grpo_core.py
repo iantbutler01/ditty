@@ -19,6 +19,7 @@ from ditty.grpo_rollouts import (
     compute_old_logprobs,
     generate_rollouts,
     make_no_signal_keepalive_record,
+    sort_tasks_for_generation_batching,
 )
 
 
@@ -143,6 +144,21 @@ class RecordingVllmEngine:
 
 
 class GRPOCoreTests(unittest.TestCase):
+    def test_sort_tasks_for_generation_batching_groups_generation_caps_stably(self) -> None:
+        tasks = [
+            {"id": "long-a", "metadata": {"rollout_max_new_tokens": 1024}},
+            {"id": "short-a", "metadata": {"rollout_max_new_tokens": 128}},
+            {"id": "long-b", "metadata": {"rollout_max_new_tokens": 1024}},
+            {"id": "short-b", "metadata": {"rollout_max_new_tokens": 128}},
+        ]
+
+        ordered = sort_tasks_for_generation_batching(
+            tasks,
+            lambda task: int(task["metadata"]["rollout_max_new_tokens"]),
+        )
+
+        self.assertEqual([task["id"] for task in ordered], ["short-a", "short-b", "long-a", "long-b"])
+
     def test_rollout_scheduler_respects_expected_token_budget(self) -> None:
         tasks = [
             {"id": "long-a", "family": "a", "metadata": {"rollout_max_new_tokens": 800}},
