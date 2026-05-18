@@ -334,6 +334,43 @@ class GRPOCoreTests(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(logits.grad)
 
+    def test_dr_gspo_ignores_empty_sequences_without_nan_in_fp16(self) -> None:
+        logits = torch.zeros((2, 3, 1), dtype=torch.float16, requires_grad=True)
+        labels = torch.zeros((2, 3), dtype=torch.long)
+        mask = torch.tensor(
+            [
+                [False, True, True],
+                [False, False, False],
+            ],
+            dtype=torch.bool,
+        )
+        old_logprobs = torch.zeros((2, 3), dtype=torch.float16)
+        advantages = torch.tensor(
+            [
+                [0.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=torch.float16,
+        )
+
+        loss, metrics = compute_grpo_loss(
+            logits=logits,
+            labels=labels,
+            mask=mask,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            config=GRPOConfig(
+                kl_beta=0.0,
+                loss_type="dr_gspo",
+                max_completion_length=4,
+            ),
+        )
+
+        self.assertTrue(torch.isfinite(loss.detach()))
+        self.assertAlmostEqual(metrics["grpo_ratio_mean"], 1.0, places=3)
+        self.assertAlmostEqual(metrics["grpo_sequence_ratio_mean"], 1.0, places=3)
+        self.assertEqual(metrics["grpo_nonfinite_log_ratio_frac"], 0.0)
+
     def test_rollout_scheduler_allows_one_task_over_budget(self) -> None:
         tasks = [
             {"id": "huge", "family": "a", "metadata": {"rollout_max_new_tokens": 800}},

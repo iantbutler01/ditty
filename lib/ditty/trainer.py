@@ -96,6 +96,19 @@ def _distributed_mean_metrics(metrics: dict[str, float]) -> dict[str, float]:
     return averaged
 
 
+def _mean_numeric_metric_dicts(metric_rows: list[dict[str, Any]]) -> dict[str, float]:
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for metrics in metric_rows:
+        for key, value in metrics.items():
+            if not isinstance(value, (int, float)):
+                continue
+            name = str(key)
+            sums[name] = sums.get(name, 0.0) + float(value)
+            counts[name] = counts.get(name, 0) + 1
+    return {key: sums[key] / counts[key] for key in sorted(sums) if counts.get(key, 0) > 0}
+
+
 def _next_checkpoint_iteration(
     *,
     local_latest_checkpoint_num: Optional[int],
@@ -505,6 +518,7 @@ class Trainer:
                         full_attention_mask = full_forward_kwargs.get("attention_mask")
                         total_loss_scalar = 0.0
                         last_loss_output = None
+                        micro_metric_rows: list[dict[str, Any]] = []
                         for chunk_idx in range(num_chunks):
                             s = chunk_idx * effective_micro_bs
                             e = min(s + effective_micro_bs, batch_size_total)
@@ -542,12 +556,23 @@ class Trainer:
                                     model_output, chunk_ctx = postprocessor.process(model_output, chunk_ctx)
                                 loss_output = self.loss_calculator.compute(model_output, chunk_ctx)
                                 chunk_loss = loss_output.loss / max(num_chunks, 1)
+                            if has_real_rows:
+                                micro_metric_rows.append(dict(loss_output.metrics))
                             self.accelerator.backward(chunk_loss)
                             total_loss_scalar += float(chunk_loss.item()) * num_chunks
                             last_loss_output = loss_output
                         _dist_debug("loss microbatch backward complete")
                         loss = torch.tensor(total_loss_scalar / max(num_chunks, 1), device=self.device)
-                        loss_output = last_loss_output  # for downstream metric logging
+                        micro_metrics = _mean_numeric_metric_dicts(micro_metric_rows)
+                        micro_metrics["loss_microbatch_real_chunks"] = float(len(micro_metric_rows))
+                        micro_metrics["loss_microbatch_synced_chunks"] = float(num_chunks)
+                        micro_metrics["loss_microbatch_effective_micro_bs"] = float(effective_micro_bs)
+                        loss_output = LossOutput(
+                            loss=loss,
+                            metrics=micro_metrics if micro_metrics else (
+                                dict(last_loss_output.metrics) if last_loss_output is not None else {}
+                            ),
+                        )
                     else:
                         with context_manager:
                             model_output = self.model(batch, **ctx.get("forward_kwargs", {}))

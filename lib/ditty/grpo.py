@@ -223,9 +223,11 @@ def gather_completion_logprobs(
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, *, epsilon: float = 1e-8) -> torch.Tensor:
-    mask = mask.to(values.dtype)
-    numerator = (values * mask).sum()
-    denominator = mask.sum().clamp(min=epsilon)
+    mask_bool = mask.to(device=values.device).bool()
+    mask_float = mask_bool.to(values.dtype)
+    masked_values = values.masked_fill(~mask_bool, 0.0)
+    numerator = (masked_values * mask_float).sum()
+    denominator = mask_float.sum().clamp(min=1.0)
     return numerator / denominator
 
 
@@ -237,20 +239,22 @@ def masked_policy_loss(
     max_completion_length: int | None,
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    mask = mask.to(objective.dtype)
-    objective_sum = (objective * mask).sum()
-    active_tokens = mask.sum()
+    mask_bool = mask.to(device=objective.device).bool()
+    mask_float = mask_bool.to(objective.dtype)
+    masked_objective = objective.masked_fill(~mask_bool, 0.0)
+    objective_sum = (masked_objective * mask_float).sum()
+    active_tokens = mask_float.sum()
     normalized_loss_type = loss_type.lower()
 
     if normalized_loss_type in {"grpo", "gspo"}:
-        per_sequence_tokens = mask.sum(dim=1).clamp(min=epsilon)
-        per_sequence_objective = (objective * mask).sum(dim=1) / per_sequence_tokens
-        active_sequences = mask.sum(dim=1).gt(0)
-        denominator = active_sequences.sum().to(objective.dtype).clamp(min=epsilon)
+        per_sequence_tokens = mask_float.sum(dim=1).clamp(min=1.0)
+        per_sequence_objective = (masked_objective * mask_float).sum(dim=1) / per_sequence_tokens
+        active_sequences = mask_bool.any(dim=1)
+        denominator = active_sequences.sum().to(objective.dtype).clamp(min=1.0)
         return -(per_sequence_objective * active_sequences.to(objective.dtype)).sum() / denominator, denominator
 
     if normalized_loss_type in {"bnpo", "dapo"}:
-        denominator = active_tokens.clamp(min=epsilon)
+        denominator = active_tokens.clamp(min=1.0)
         return -objective_sum / denominator, denominator
 
     if normalized_loss_type in {"dr_grpo", "dr_gspo"}:
@@ -378,14 +382,26 @@ def compute_grpo_loss(
         )
 
     log_ratio = token_logprobs - shifted_old_logprobs
+    valid_mask_float = valid_mask.to(log_ratio.dtype)
+    valid_log_ratio = log_ratio.masked_fill(~valid_mask, 0.0)
+    valid_token_count = valid_mask_float.sum().clamp(min=1.0)
+    nonfinite_token_logprobs = (~torch.isfinite(token_logprobs) & valid_mask).to(log_ratio.dtype)
+    nonfinite_old_logprobs = (~torch.isfinite(shifted_old_logprobs) & valid_mask).to(log_ratio.dtype)
+    nonfinite_log_ratio = (~torch.isfinite(log_ratio) & valid_mask).to(log_ratio.dtype)
     clip_min, clip_max = clip_bounds(config)
     normalized_loss_type = config.loss_type.lower()
 
     if normalized_loss_type == "gspo":
         # Vanilla GSPO (Eq. 5): one sequence ratio per rollout, gradient flows through s_i
         # directly via the live token log-probs that compose it.
-        token_counts = valid_mask.sum(dim=1).clamp(min=config.epsilon).to(log_ratio.dtype)
-        sequence_log_ratio = (log_ratio * valid_mask.to(log_ratio.dtype)).sum(dim=1) / token_counts
+        sequence_valid = valid_mask.any(dim=1)
+        token_counts = valid_mask_float.sum(dim=1).clamp(min=1.0)
+        sequence_log_ratio = valid_log_ratio.sum(dim=1) / token_counts
+        sequence_log_ratio = torch.where(
+            sequence_valid,
+            sequence_log_ratio,
+            torch.zeros_like(sequence_log_ratio),
+        )
         sequence_ratio = torch.exp(sequence_log_ratio).unsqueeze(1)
         clipped_sequence_ratio = torch.clamp(sequence_ratio, min=clip_min, max=clip_max)
         unclipped_objective = sequence_ratio * shifted_advantages
@@ -398,8 +414,14 @@ def compute_grpo_loss(
         # is detached so gradient flows only through the live token log-probs, preserving
         # per-token credit semantics when A_{i,t} varies (e.g. FICA per-span credit) while
         # keeping GSPO's variance-bounded importance correction.
-        token_counts = valid_mask.sum(dim=1).clamp(min=config.epsilon).to(log_ratio.dtype)
-        sequence_log_ratio = (log_ratio * valid_mask.to(log_ratio.dtype)).sum(dim=1) / token_counts
+        sequence_valid = valid_mask.any(dim=1)
+        token_counts = valid_mask_float.sum(dim=1).clamp(min=1.0)
+        sequence_log_ratio = valid_log_ratio.sum(dim=1) / token_counts
+        sequence_log_ratio = torch.where(
+            sequence_valid,
+            sequence_log_ratio,
+            torch.zeros_like(sequence_log_ratio),
+        )
         sequence_ratio = torch.exp(sequence_log_ratio).unsqueeze(1)
         sequence_ratio_detached = sequence_ratio.detach()
         clipped_sequence_ratio = torch.clamp(sequence_ratio_detached, min=clip_min, max=clip_max)
@@ -461,6 +483,15 @@ def compute_grpo_loss(
         "grpo_ratio_mean": float(masked_mean(ratio, valid_mask, epsilon=config.epsilon).item()),
         "grpo_clipfrac": float(clip_fraction.item()),
         "grpo_policy_denominator": float(policy_denominator.item()),
+        "grpo_nonfinite_token_logprob_frac": float(
+            (nonfinite_token_logprobs.sum() / valid_token_count).item()
+        ),
+        "grpo_nonfinite_old_logprob_frac": float(
+            (nonfinite_old_logprobs.sum() / valid_token_count).item()
+        ),
+        "grpo_nonfinite_log_ratio_frac": float(
+            (nonfinite_log_ratio.sum() / valid_token_count).item()
+        ),
     }
     if normalized_loss_type in {"gspo", "dr_gspo"}:
         sequence_valid = valid_mask.any(dim=1)
