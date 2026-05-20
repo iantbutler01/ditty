@@ -19,8 +19,10 @@ from ditty.grpo_rollouts import (
     compute_old_logprobs,
     generate_rollouts,
     make_no_signal_keepalive_record,
+    prepare_rollout_training_context,
     sort_tasks_for_generation_batching,
 )
+from ditty.loss import GRPOLoss
 
 
 class DummyTokenizer:
@@ -237,6 +239,57 @@ class GRPOCoreTests(unittest.TestCase):
         max_int.assert_called_once()
         self.assertEqual(model.forward_calls, 3)
         self.assertEqual(tuple(old_logprobs.shape), (1, 4))
+
+    def test_prepare_rollout_context_populates_reference_logprobs_when_kl_enabled(self) -> None:
+        record = RolloutRecord(
+            task={"id": "t0"},
+            group_id="g0",
+            sample_id="s0",
+            prompt_text="prompt",
+            prompt_ids=[1, 1],
+            completion_ids=[1, 1],
+            completion_text="answer",
+            reward=1.0,
+        )
+        ctx = {}
+
+        def reference_logprobs(batch, config):
+            self.assertEqual(config.kl_beta, 0.05)
+            return torch.full_like(batch["labels"], -0.25, dtype=torch.float32)
+
+        input_ids = prepare_rollout_training_context(
+            model=FixedTokenLM(),
+            tokenizer=DummyTokenizer(),
+            records=[record],
+            device=torch.device("cpu"),
+            grpo_config=GRPOConfig(kl_beta=0.05),
+            ctx=ctx,
+            reference_logprob_fn=reference_logprobs,
+        )
+
+        self.assertEqual(tuple(input_ids.shape), (1, 4))
+        self.assertIn("reference_logprobs", ctx)
+        self.assertEqual(tuple(ctx["reference_logprobs"].shape), tuple(ctx["target"].shape))
+
+    def test_grpo_loss_reads_reference_logprobs_default_key(self) -> None:
+        logits = torch.zeros((1, 3, 2), dtype=torch.float32, requires_grad=True)
+        labels = torch.tensor([[0, 1, 1]], dtype=torch.long)
+        mask = torch.tensor([[False, True, True]])
+        ctx = {
+            "target": labels,
+            "mask": mask,
+            "old_logprobs": torch.zeros((1, 3), dtype=torch.float32),
+            "reference_logprobs": torch.full((1, 3), -1.0, dtype=torch.float32),
+            "advantages": torch.ones((1, 3), dtype=torch.float32),
+        }
+
+        output = GRPOLoss(
+            config=GRPOConfig(kl_beta=0.5, loss_type="dr_grpo", max_completion_length=2),
+            target_key="target",
+            mask_key="mask",
+        ).compute((SimpleNamespace(logits=logits),), ctx)
+
+        self.assertGreater(output.metrics["grpo_kl"], 0.0)
 
     def test_keepalive_rollout_preserves_loss_microbatch_config(self) -> None:
         preprocessor = GRPORolloutPreProcessor(

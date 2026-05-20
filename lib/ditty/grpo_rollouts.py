@@ -692,6 +692,7 @@ TaskSignatureFn = Callable[[Any], str]
 ProgressFn = Callable[[str], None]
 RolloutCallback = Callable[[list[RolloutRecord], dict[str, Any], Context], None]
 EnvironmentReplayFn = Callable[[Any, str], Mapping[str, Any] | None]
+ReferenceLogprobFn = Callable[[dict[str, Any], GRPOConfig], torch.Tensor]
 
 
 def _metric_key(value: str) -> str:
@@ -1645,6 +1646,7 @@ def compute_old_logprobs(
     config: GRPOConfig,
     *,
     micro_batch_size: int | None = None,
+    sync_micro_batches: bool = True,
 ) -> torch.Tensor:
     model.eval()
     labels = batch["labels"]
@@ -1654,7 +1656,11 @@ def compute_old_logprobs(
         return _compute_old_logprobs_single(model, batch, config)
 
     local_chunks = max((batch_size + micro_bs - 1) // micro_bs, 1)
-    num_chunks = _distributed_max_int(local_chunks, device=labels.device)
+    num_chunks = (
+        _distributed_max_int(local_chunks, device=labels.device)
+        if sync_micro_batches
+        else local_chunks
+    )
     if num_chunks <= 1:
         return _compute_old_logprobs_single(model, batch, config)
     effective_micro_bs = (batch_size + num_chunks - 1) // num_chunks
@@ -1691,6 +1697,7 @@ def prepare_rollout_training_context(
     max_policy_age_updates: int | None = 0,
     max_rollout_reuse: int | None = 1,
     old_logprob_micro_batch_size: int | None = None,
+    reference_logprob_fn: ReferenceLogprobFn | None = None,
 ) -> torch.Tensor:
     if rollout_batch is not None:
         rollout_batch.validate_for_step(
@@ -1719,6 +1726,24 @@ def prepare_rollout_training_context(
     if progress_fn:
         step_prefix = f"step {step} " if step is not None else ""
         progress_fn(f"{step_prefix}old_logprobs done")
+    reference_logprobs = None
+    if reference_logprob_fn is not None and grpo_config.kl_beta != 0.0:
+        if progress_fn:
+            step_prefix = f"step {step} " if step is not None else ""
+            progress_fn(f"{step_prefix}reference_logprobs start")
+        reference_logprobs = reference_logprob_fn(grpo_batch, grpo_config)
+        if not isinstance(reference_logprobs, torch.Tensor):
+            raise TypeError(
+                "reference_logprob_fn must return a torch.Tensor shaped like rollout labels"
+            )
+        if tuple(reference_logprobs.shape) != tuple(grpo_batch["labels"].shape):
+            raise ValueError(
+                f"reference_logprobs shape {tuple(reference_logprobs.shape)} did not match labels "
+                f"shape {tuple(grpo_batch['labels'].shape)}"
+            )
+        if progress_fn:
+            step_prefix = f"step {step} " if step is not None else ""
+            progress_fn(f"{step_prefix}reference_logprobs done")
     model.train()
 
     forward_kwargs, logits_positions = prepare_grpo_forward_kwargs(
@@ -1733,6 +1758,8 @@ def prepare_rollout_training_context(
     ctx["target"] = grpo_batch["labels"]
     ctx["mask"] = grpo_batch["completion_mask"]
     ctx["old_logprobs"] = old_logprobs
+    if reference_logprobs is not None:
+        ctx["reference_logprobs"] = reference_logprobs
     ctx["advantages"] = grpo_batch["advantages"]
     ctx["rollout_records"] = list(records)
     rollout_metrics = {
@@ -1780,6 +1807,7 @@ class GRPORolloutPreProcessor(PreProcessor):
         functional_credit_config: FunctionalCreditConfig | None = None,
         progress_fn: ProgressFn | None = None,
         on_rollouts: RolloutCallback | None = None,
+        reference_logprob_fn: ReferenceLogprobFn | None = None,
         rebalance_across_ranks: bool = False,
         loss_micro_batch_size: int | None = None,
         old_logprob_micro_batch_size: int | None = None,
@@ -1817,6 +1845,7 @@ class GRPORolloutPreProcessor(PreProcessor):
             self.rollout_scheduler.prime(self.task_pool, self.task_signature_fn)
         self.progress_fn = progress_fn
         self.on_rollouts = on_rollouts
+        self.reference_logprob_fn = reference_logprob_fn
         self.rebalance_across_ranks = bool(rebalance_across_ranks)
         self.loss_micro_batch_size = (
             int(loss_micro_batch_size) if loss_micro_batch_size and loss_micro_batch_size > 0 else None
@@ -2083,6 +2112,7 @@ class GRPORolloutPreProcessor(PreProcessor):
                 max_policy_age_updates=self.max_policy_age_updates,
                 max_rollout_reuse=self.max_rollout_reuse,
                 old_logprob_micro_batch_size=self.old_logprob_micro_batch_size,
+                reference_logprob_fn=self.reference_logprob_fn,
             )
             ctx["rollout_batch"] = rollout_batch
             ctx["rollout_all_records"] = list(rollout_batch.all_records)
@@ -2113,6 +2143,7 @@ class GRPORolloutPreProcessor(PreProcessor):
             max_policy_age_updates=self.max_policy_age_updates,
             max_rollout_reuse=self.max_rollout_reuse,
             old_logprob_micro_batch_size=self.old_logprob_micro_batch_size,
+            reference_logprob_fn=self.reference_logprob_fn,
         )
         if self.loss_micro_batch_size is not None:
             ctx["loss_micro_batch_size"] = int(self.loss_micro_batch_size)
@@ -2144,4 +2175,5 @@ class GRPORolloutPreProcessor(PreProcessor):
                 if self.functional_credit_config is not None
                 else None
             ),
+            "reference_logprobs": self.reference_logprob_fn is not None,
         }

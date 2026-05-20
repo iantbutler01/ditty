@@ -140,6 +140,15 @@ class RayVllmActor:
 
         self.llm = None
         self._is_asleep = False
+        allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments" in allocator_config:
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+            os.environ.pop("PYTORCH_ALLOC_CONF", None)
+            print(
+                "[rank 0] ray_vllm cleared expandable_segments allocator config "
+                "for vLLM memory pool compatibility",
+                flush=True,
+            )
         uses_ray_executor = distributed_executor_backend == "ray" or distributed_executor_backend.endswith("RayDistributedExecutor")
         if uses_ray_executor:
             os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(str(i) for i in range(int(tensor_parallel_size)))

@@ -169,7 +169,7 @@ class GRPOLoss(LossCalculator):
         self,
         config: Optional[GRPOConfig] = None,
         old_logprob_key: str = "old_logprobs",
-        reference_logprob_key: str = "ref_logprobs",
+        reference_logprob_key: str = "reference_logprobs",
         advantage_key: str = "advantages",
         **kwargs,
     ):
@@ -192,6 +192,10 @@ class GRPOLoss(LossCalculator):
         else:
             logits = self.get_prediction(model_output)
 
+        reference_logprobs = ctx.get(self.reference_logprob_key)
+        if reference_logprobs is None and self.reference_logprob_key != "ref_logprobs":
+            reference_logprobs = ctx.get("ref_logprobs")
+
         loss, metrics = compute_grpo_loss(
             logits=logits,
             hidden_states=hidden_states,
@@ -199,7 +203,7 @@ class GRPOLoss(LossCalculator):
             mask=mask,
             old_logprobs=ctx[self.old_logprob_key],
             advantages=ctx[self.advantage_key],
-            reference_logprobs=ctx.get(self.reference_logprob_key),
+            reference_logprobs=reference_logprobs,
             config=self.config,
             model=ctx.get("model"),
             logits_positions=ctx.get("logits_positions"),
