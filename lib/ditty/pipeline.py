@@ -27,6 +27,15 @@ logging.basicConfig(level=logging.INFO)
 
 logger = getLogger("ditty_pipeline")
 
+MUON_ADAMW_NAME_FRAGMENTS = (
+    "embed",
+    "embedding",
+    "lm_head",
+    "output",
+    "classifier",
+    "score",
+)
+
 
 class Pipeline:
     def __init__(
@@ -50,10 +59,16 @@ class Pipeline:
         load_optimizer_checkpoint: bool = True,
         gradient_checkpointing: bool = True,
         use_8bit_optim: bool = False,
-        optim_backend: str = "torchao",  # "torch", "bnb", "torchao", or "adafactor"
+        optim_backend: str = "torchao",  # "torch", "bnb", "torchao", "adafactor", or "muon"
         lr: float = 1e-4,
         scale_lr_by_world_size: bool = True,
         weight_decay: float = 0.01,
+        muon_lr: Optional[float] = None,
+        muon_weight_decay: Optional[float] = None,
+        muon_momentum: float = 0.95,
+        muon_nesterov: bool = True,
+        muon_ns_steps: int = 5,
+        muon_adjust_lr_fn: Optional[str] = None,
         max_grad_norm: float = 1.0,
         epochs: int = 1,
         max_steps: Optional[int] = None,
@@ -98,6 +113,12 @@ class Pipeline:
         self.lr = lr
         self.scale_lr_by_world_size = scale_lr_by_world_size
         self.weight_decay = weight_decay
+        self.muon_lr = muon_lr
+        self.muon_weight_decay = muon_weight_decay
+        self.muon_momentum = muon_momentum
+        self.muon_nesterov = muon_nesterov
+        self.muon_ns_steps = muon_ns_steps
+        self.muon_adjust_lr_fn = muon_adjust_lr_fn
         self.max_grad_norm = max_grad_norm
         self.epochs = epochs
         self.max_steps = max_steps
@@ -333,6 +354,90 @@ class Pipeline:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+    @staticmethod
+    def _should_use_muon(name: str, param: nn.Parameter) -> bool:
+        if not param.requires_grad or param.ndim != 2:
+            return False
+        lowered = name.lower()
+        return not any(fragment in lowered for fragment in MUON_ADAMW_NAME_FRAGMENTS)
+
+    def _create_muon_optimizer(self, model: nn.Module, lr: float):
+        muon_cls = getattr(torch.optim, "Muon", None)
+        if muon_cls is None:
+            raise ImportError(
+                "optim_backend='muon' requires a PyTorch build that provides torch.optim.Muon. "
+                "Upgrade torch or pass a custom optimizer to Pipeline."
+            )
+
+        seen_param_ids = set()
+        muon_params = []
+        adamw_params = []
+        for name, param in model.named_parameters():
+            param_id = id(param)
+            if param_id in seen_param_ids or not param.requires_grad:
+                continue
+            seen_param_ids.add(param_id)
+            if self._should_use_muon(name, param):
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+
+        if isinstance(self.loss_calculator, nn.Module):
+            for param in self.loss_calculator.parameters():
+                param_id = id(param)
+                if param_id in seen_param_ids or not param.requires_grad:
+                    continue
+                seen_param_ids.add(param_id)
+                adamw_params.append(param)
+
+        if not muon_params:
+            raise ValueError(
+                "optim_backend='muon' selected, but no trainable 2D non-embedding "
+                "model parameters were found for torch.optim.Muon."
+            )
+
+        optimizers = []
+        if adamw_params:
+            optimizers.append(
+                torch.optim.AdamW(
+                    adamw_params,
+                    lr=lr,
+                    weight_decay=self.weight_decay,
+                    betas=(0.9, 0.999),
+                    eps=1e-8,
+                )
+            )
+
+        muon_lr = lr if self.muon_lr is None else self.muon_lr
+        muon_weight_decay = (
+            self.weight_decay if self.muon_weight_decay is None else self.muon_weight_decay
+        )
+        optimizers.append(
+            muon_cls(
+                muon_params,
+                lr=muon_lr,
+                weight_decay=muon_weight_decay,
+                momentum=self.muon_momentum,
+                nesterov=self.muon_nesterov,
+                ns_steps=self.muon_ns_steps,
+                adjust_lr_fn=self.muon_adjust_lr_fn,
+            )
+        )
+
+        logger.info(
+            "Created Muon optimizer split: %s tensor(s) with torch.optim.Muon, "
+            "%s tensor(s) with AdamW fallback.",
+            len(muon_params),
+            len(adamw_params),
+        )
+
+        if len(optimizers) == 1:
+            return optimizers[0]
+
+        from .optimizers import ChainedOptimizer
+
+        return ChainedOptimizer(optimizers)
+
     def _create_optimizer(self, model: nn.Module, checkpoint: Optional[Checkpoint] = None):
         """Create optimizer and optionally load state from checkpoint."""
         world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -359,6 +464,8 @@ class Pipeline:
                 weight_decay=self.weight_decay,
                 foreach=False,
             )
+        elif self.optim_backend == "muon":
+            optimizer = self._create_muon_optimizer(model, lr)
         elif self.use_8bit_optim:
             if self.optim_backend == "bnb":
                 if is_fsdp:

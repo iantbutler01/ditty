@@ -12,6 +12,7 @@ Ditty has support for:
 - 8bit, 4bit quantization
 - FP16, BFLOAT16, FP8 (via transformer-engine)
 - 8bit Adam (torchao or bitsandbytes backends)
+- Muon via `torch.optim.Muon`
 - FSDP2 with DTensor-based sharding
 - FSDP + QLORA (needs testing with FSDP2)
 - torch.compile compatible
@@ -54,6 +55,23 @@ pipeline = Pipeline(
     dataset=dataset,
     use_8bit_optim=True,
     optim_backend="torchao",  # or "bnb"
+    ...
+)
+```
+
+### Muon
+
+Muon is available through PyTorch's upstream `torch.optim.Muon`. Ditty uses Muon
+for trainable 2D hidden weights and AdamW for embeddings, heads, biases, norms,
+and loss-module parameters.
+
+```python
+pipeline = Pipeline(
+    model_factory=model_factory,
+    dataset=dataset,
+    optim_backend="muon",
+    lr=3e-4,        # AdamW fallback lr
+    muon_lr=0.02,  # torch.optim.Muon lr
     ...
 )
 ```
