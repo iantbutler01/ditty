@@ -7,7 +7,6 @@ from .checkpoint import CheckpointManager
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from accelerate import Accelerator
 from accelerate.utils import send_to_device, set_seed
 from transformers.trainer_pt_utils import get_model_param_count
@@ -218,30 +217,18 @@ class Trainer:
         elif self.fp16:
             self.f16_dtype = torch.float16
 
-        self.device = self.accelerator.device
+        if self.is_fsdp:
+            if torch.cuda.is_available():
+                local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                self.device = torch.device(f"cuda:{local_rank}")
+            else:
+                self.device = torch.device("cpu")
+        else:
+            self.device = self.accelerator.device
         self._manual_device_placement = False
 
         if self.is_fsdp:
-            dataloader_is_pre_sharded = (
-                hasattr(self.dataset, "sampler") and isinstance(self.dataset.sampler, DistributedSampler)
-            )
-            if self.use_scheduler:
-                if dataloader_is_pre_sharded:
-                    self.optimizer, self.scheduler = self.accelerator.prepare(
-                        self.optimizer, self.scheduler
-                    )
-                else:
-                    self.optimizer, self.dataset, self.scheduler = self.accelerator.prepare(
-                        self.optimizer, self.dataset, self.scheduler
-                    )
-            else:
-                if dataloader_is_pre_sharded:
-                    self.optimizer = self.accelerator.prepare(self.optimizer)
-                else:
-                    self.optimizer, self.dataset = self.accelerator.prepare(
-                        self.optimizer, self.dataset
-                    )
-            self._manual_device_placement = dataloader_is_pre_sharded
+            self._manual_device_placement = True
         else:
             if self.use_scheduler:
                 (
@@ -273,6 +260,87 @@ class Trainer:
         )
         self._last_checkpoint_total_steps: int | None = None
 
+    def _distributed_initialized(self) -> bool:
+        return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+    def _rank(self) -> int:
+        if self._distributed_initialized():
+            return torch.distributed.get_rank()
+        return int(os.environ.get("RANK", 0))
+
+    def _world_size(self) -> int:
+        if self._distributed_initialized():
+            return torch.distributed.get_world_size()
+        return int(os.environ.get("WORLD_SIZE", 1))
+
+    def _is_main_process(self) -> bool:
+        if self.is_fsdp:
+            return self._rank() == 0
+        return self.accelerator.is_main_process
+
+    def _num_processes(self) -> int:
+        if self.is_fsdp:
+            return self._world_size()
+        return self.accelerator.num_processes
+
+    def _wait_for_everyone(self) -> None:
+        if self.is_fsdp:
+            if self._distributed_initialized() and self._world_size() > 1:
+                torch.distributed.barrier()
+            return
+        self.accelerator.wait_for_everyone()
+
+    def _unwrap_model_for_save(self) -> nn.Module:
+        if self.is_fsdp:
+            return self.model
+        return self.accelerator.unwrap_model(self.model)
+
+    def _scaler_for_save(self) -> Optional[torch.amp.GradScaler]:
+        if self.is_fsdp:
+            return None
+        return (
+            self.accelerator.scaler
+            if hasattr(self.accelerator, "scaler") and self.accelerator.scaler
+            else None
+        )
+
+    def _accumulate_context(self):
+        if self.is_fsdp:
+            return contextlib.nullcontext()
+        return self.accelerator.accumulate(self.model)
+
+    def _backward(self, loss: torch.Tensor) -> None:
+        if self.is_fsdp:
+            loss.backward()
+        else:
+            self.accelerator.backward(loss)
+
+    def _loss_for_backward(self, loss: torch.Tensor) -> torch.Tensor:
+        if self.is_fsdp and self.grad_accum > 1:
+            return loss / self.grad_accum
+        return loss
+
+    def _should_step_optimizer(
+        self,
+        completed_step: int,
+        *,
+        end_of_epoch: bool = False,
+        stopping: bool = False,
+    ) -> bool:
+        if not self.is_fsdp:
+            return True
+        return completed_step % max(int(self.grad_accum), 1) == 0 or end_of_epoch or stopping
+
+    def _clip_grad_norm_if_needed(self, *, should_step_optimizer: bool) -> None:
+        if self.max_grad_norm is None or self.max_grad_norm <= 0:
+            return
+        if self.is_fsdp:
+            if should_step_optimizer:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            return
+        if self.accelerator.sync_gradients:
+            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
     def _save(self, no_dist=False):
         rank = int(os.environ.get("RANK", 0))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -280,13 +348,13 @@ class Trainer:
         checkpoint_num = self._checkpoint_iteration
         training_state = self.state.state_dict()
 
-        if self.accelerator.num_processes > 1 and not torch.distributed.is_initialized():
+        if self._num_processes() > 1 and not torch.distributed.is_initialized():
             _dist_debug(
                 "skipping checkpoint save because the distributed process group is no longer initialized"
             )
             return
 
-        if self.accelerator.is_main_process:
+        if self._is_main_process():
             logger.info(f"Saving checkpoint at step {self.state.steps} (total: {self.state.total_steps})")
         _dist_debug(
             f"entering _save(checkpoint_num={self._checkpoint_iteration}, "
@@ -294,7 +362,7 @@ class Trainer:
         )
         _dist_debug("waiting for everyone before checkpoint save")
         try:
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
         except (RuntimeError, ValueError) as error:
             if rank == 0:
                 logger.warning(
@@ -306,11 +374,11 @@ class Trainer:
 
         self.checkpoint_manager.save(
             checkpoint_num=checkpoint_num,
-            model=self.accelerator.unwrap_model(self.model),
+            model=self._unwrap_model_for_save(),
             optimizer=self.optimizer,
             training_state=training_state,
             scheduler=self.scheduler if self.use_scheduler else None,
-            scaler=self.accelerator.scaler if hasattr(self.accelerator, 'scaler') and self.accelerator.scaler else None,
+            scaler=self._scaler_for_save(),
             loss_calculator=self.loss_calculator,
             preprocessors=self.preprocessors,
             is_fsdp=self.is_fsdp,
@@ -325,7 +393,7 @@ class Trainer:
                     world_size=world_size,
                 )
             try:
-                self.accelerator.wait_for_everyone()
+                self._wait_for_everyone()
             except (RuntimeError, ValueError) as error:
                 if rank == 0:
                     logger.warning(
@@ -344,7 +412,7 @@ class Trainer:
         if rank == 0:
             self.checkpoint_manager.prune_old_checkpoints()
         try:
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
         except (RuntimeError, ValueError) as error:
             if rank == 0:
                 logger.warning(
@@ -369,7 +437,7 @@ class Trainer:
             try:
                 shutdown()
             except BaseException as error:
-                if self.accelerator.is_main_process:
+                if self._is_main_process():
                     logger.warning(
                         "Pipeline component shutdown failed for %s: %s",
                         component.__class__.__name__,
@@ -411,17 +479,17 @@ class Trainer:
                     "stop_training, or None."
                 )
             stop_training = stop_training or bool(result.get("stop_training", False))
-            if self.metrics_logger is not None and self.accelerator.is_main_process:
+            if self.metrics_logger is not None and self._is_main_process():
                 for key, value in result.items():
                     if key == "stop_training":
                         continue
                     if isinstance(value, (int, float)):
                         self.metrics_logger.log_scalar(f"validation/{key}", float(value), step)
 
-        if self.accelerator.num_processes > 1 and torch.distributed.is_initialized():
+        if self._num_processes() > 1 and torch.distributed.is_initialized():
             stop_tensor = torch.tensor(
                 1 if stop_training else 0,
-                device=self.accelerator.device,
+                device=self.device,
                 dtype=torch.int,
             )
             torch.distributed.all_reduce(stop_tensor, op=torch.distributed.ReduceOp.MAX)
@@ -449,6 +517,10 @@ class Trainer:
         stop_requested = False
         for ep in range(self.state.epoch, epochs):
             dataset = self.dataset
+            try:
+                batches_in_epoch = len(dataset)
+            except TypeError:
+                batches_in_epoch = None
             _dist_debug(f"starting epoch loop ep={ep}")
 
             if self.shuffle_each_epoch:
@@ -457,7 +529,7 @@ class Trainer:
                 elif hasattr(dataset, "sampler") and hasattr(dataset.sampler, "set_epoch"):
                     dataset.sampler.set_epoch(ep)
 
-            for batch in dataset:
+            for batch_idx, batch in enumerate(dataset):
                 if batch is None:
                     break
 
@@ -486,7 +558,7 @@ class Trainer:
                 if batch is None:
                     continue
 
-                with self.accelerator.accumulate(self.model):
+                with self._accumulate_context():
                     # Micro-batching support: when ctx supplies `loss_micro_batch_size`,
                     # split the batch (and per-sequence ctx tensors) along dim 0 into
                     # equal-ish chunks, forward+backward each chunk separately, then
@@ -560,7 +632,7 @@ class Trainer:
                                 chunk_loss = loss_output.loss / max(num_chunks, 1)
                             if has_real_rows:
                                 micro_metric_rows.append(dict(loss_output.metrics))
-                            self.accelerator.backward(chunk_loss)
+                            self._backward(self._loss_for_backward(chunk_loss))
                             total_loss_scalar += float(chunk_loss.item()) * num_chunks
                             last_loss_output = loss_output
                         _dist_debug("loss microbatch backward complete")
@@ -587,13 +659,21 @@ class Trainer:
                             loss_output = self.loss_calculator.compute(model_output, ctx)
                             loss = loss_output.loss
 
-                        self.accelerator.backward(loss)
-
-                    if self.max_grad_norm is not None and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self._backward(self._loss_for_backward(loss))
 
                     completed_step = self.state.steps + 1
                     completed_total_steps = self.state.total_steps + 1
+                    end_of_epoch = (
+                        batches_in_epoch is not None and batch_idx + 1 >= batches_in_epoch
+                    )
+                    stopping_for_max = max_steps is not None and completed_total_steps >= max_steps
+                    should_step_optimizer = self._should_step_optimizer(
+                        completed_step,
+                        end_of_epoch=end_of_epoch,
+                        stopping=stopping_for_max,
+                    )
+
+                    self._clip_grad_norm_if_needed(should_step_optimizer=should_step_optimizer)
 
                     # Log gradients AFTER clip_grad_norm_ to avoid FSDP2 sync issues
                     # clip_grad_norm_ involves all-reduce, so all ranks must finish it first
@@ -601,13 +681,14 @@ class Trainer:
                         hasattr(self.metrics_logger, 'log_gradients') and
                         hasattr(self.metrics_logger, 'gradient_log_every') and
                         completed_step % self.metrics_logger.gradient_log_every == 0 and
-                        self.accelerator.is_main_process):
+                        self._is_main_process()):
                         self.metrics_logger.log_gradients(self.model, completed_total_steps)
                     batch_loss = loss.item()
-                    self.optimizer.step()
-                    if self.use_scheduler and self.scheduler:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    if should_step_optimizer:
+                        self.optimizer.step()
+                        if self.use_scheduler and self.scheduler:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
 
                     time_elapsed = time.time() - start_time
                     current_epoch_decimal, batch_info, progress_info = _format_progress_state(
@@ -622,7 +703,7 @@ class Trainer:
                     if completed_step % self.log_every == 0:
                         log_metrics = _distributed_mean_metrics(loss_output.metrics)
 
-                    if completed_step % self.log_every == 0 and self.accelerator.is_main_process:
+                    if completed_step % self.log_every == 0 and self._is_main_process():
                         metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in log_metrics.items())
                         logger.info(
                             f"Epoch {current_epoch_decimal:.2f} | {batch_info} | "
@@ -659,7 +740,7 @@ class Trainer:
                 _dist_debug("max_steps reached, leaving epoch loop without resetting step state")
                 break
             _dist_debug(f"epoch {ep} complete, waiting for everyone before epoch increment")
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
             _dist_debug(f"epoch {ep} post-wait complete")
             self.state.epoch += 1
             self.state.steps = 0
@@ -668,25 +749,25 @@ class Trainer:
         if self.save_final_checkpoint:
             if self._should_skip_final_checkpoint():
                 _dist_debug("training loop complete, skipping duplicate final checkpoint")
-                if self.accelerator.is_main_process:
+                if self._is_main_process():
                     logger.info(
                         "Skipping final checkpoint at step %s (total: %s); latest checkpoint already covers this state",
                         self.state.steps,
                         self.state.total_steps,
                     )
-                self.accelerator.wait_for_everyone()
+                self._wait_for_everyone()
             else:
                 _dist_debug("training loop complete, invoking final _save()")
                 self._save()
                 _dist_debug("final _save() returned")
         else:
             _dist_debug("training loop complete, final checkpoint disabled")
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
 
         return self.state.global_loss / self.state.total_steps if self.state.total_steps > 0 else 0
 
     def train(self, epochs=1, max_steps=None):
-        if self.accelerator.is_main_process:
+        if self._is_main_process():
             logger.info("***** Running training *****")
             try:
                 logger.info(f"  Num examples = {len(self.dataset):,}")

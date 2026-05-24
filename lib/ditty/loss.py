@@ -98,11 +98,22 @@ def fused_linear_cross_entropy(
         return loss
 
     if backend == "cce":
+        if bias is not None:
+            return _chunked_linear_cross_entropy(
+                hidden,
+                weight,
+                target,
+                bias=bias,
+                mask=mask,
+                ignore_index=ignore_index,
+                include_padding_in_normalization=include_padding_in_normalization,
+                chunk_size=chunk_size,
+            )
         loss = linear_cross_entropy(
             hidden,
-            weight.T,
+            weight,
             target,
-            bias=bias,
+            ignore_index=ignore_index,
             reduction="mean" if mask is None else "none",
         )
         if mask is not None:

@@ -156,16 +156,59 @@ class Pipeline:
     def _prepare_dataloader(self):
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         rank = int(os.environ.get("RANK", 0))
+        is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
 
         if isinstance(self._dataset, DataLoader):
-            self._is_iterable_dataset = isinstance(getattr(self._dataset, "dataset", None), IterableDataset)
+            dataloader = self._dataset
+            dataset = getattr(dataloader, "dataset", None)
+            self._is_iterable_dataset = isinstance(dataset, IterableDataset)
+
+            if (
+                is_fsdp
+                and world_size > 1
+                and dataset is not None
+                and not self._is_iterable_dataset
+                and not isinstance(getattr(dataloader, "sampler", None), DistributedSampler)
+            ):
+                sampler_seed = self.seed if self.seed is not None else 42
+                drop_last = bool(getattr(getattr(dataloader, "batch_sampler", None), "drop_last", False))
+                sampler = DistributedSampler(
+                    dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=self.shuffle_each_epoch,
+                    seed=sampler_seed,
+                    drop_last=drop_last,
+                )
+                batch_size = dataloader.batch_size or self.batch_size
+                dataloader_kwargs = {
+                    "batch_size": batch_size,
+                    "sampler": sampler,
+                    "collate_fn": dataloader.collate_fn,
+                    "num_workers": dataloader.num_workers,
+                    "pin_memory": dataloader.pin_memory,
+                    "drop_last": drop_last,
+                    "worker_init_fn": dataloader.worker_init_fn,
+                    "persistent_workers": dataloader.persistent_workers,
+                }
+                if dataloader.num_workers > 0:
+                    dataloader_kwargs["prefetch_factor"] = dataloader.prefetch_factor
+                dataloader = DataLoader(dataset, **dataloader_kwargs)
+                if rank == 0:
+                    logger.info(
+                        "Using DistributedSampler for FSDP2 DataLoader input "
+                        "(%s ranks, batch_size=%s).",
+                        world_size,
+                        batch_size,
+                    )
+
             try:
-                dataset_size = len(self._dataset.dataset)
-                total_batches = (dataset_size // world_size + self.batch_size - 1) // self.batch_size * self.epochs
+                dataset_size = len(dataloader.dataset)
+                total_batches = len(dataloader) * self.epochs
             except TypeError:
                 dataset_size = None
                 total_batches = None
-            return self._dataset, dataset_size, total_batches
+            return dataloader, dataset_size, total_batches
 
         dataset = self._dataset
         original_dataset_size = len(dataset)
@@ -622,7 +665,10 @@ class Pipeline:
         acc_kwargs.update(self.accelerator_kwargs)
         self.accelerator = Accelerator(**acc_kwargs)
 
-        if self.accelerator.is_main_process:
+        is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
+        is_main_process = rank == 0 if is_fsdp else self.accelerator.is_main_process
+
+        if is_main_process:
             logger.info(f"Mixed precision: {self.accelerator.mixed_precision}")
             logger.info(f"Model: {self.model.__class__.__name__}")
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -631,7 +677,7 @@ class Pipeline:
             logger.info(f"  Trainable params: {trainable_params:,}")
             logger.info(f"  Loss calculator: {self.loss_calculator.__class__.__name__}")
 
-        # Step 6: Create trainer (prepare() happens inside trainer)
+        # Step 6: Create trainer (prepare() happens inside trainer for non-FSDP paths)
         trainer = Trainer(
             model=self.model,
             optimizer=self.optimizer,
@@ -657,7 +703,7 @@ class Pipeline:
             hf_hub_token=self.hf_hub_token,
             shuffle_each_epoch=self.shuffle_each_epoch,
             total_batches=self.total_batches,
-            is_fsdp=self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False,
+            is_fsdp=is_fsdp,
             initial_state=trainer_state,
             initial_checkpoint_num=checkpoint.checkpoint_num if checkpoint is not None else None,
         )
@@ -665,24 +711,29 @@ class Pipeline:
         try:
             trainer.train(epochs=self.epochs, max_steps=self.max_steps)
 
-            self.accelerator.wait_for_everyone()
+            if is_fsdp:
+                if torch.distributed.is_available() and torch.distributed.is_initialized() and world_size > 1:
+                    torch.distributed.barrier()
+            else:
+                self.accelerator.wait_for_everyone()
 
             if self.push_to_hub_flag:
-                model = self.accelerator.unwrap_model(self.model)
+                model = self.model if is_fsdp else self.accelerator.unwrap_model(self.model)
 
                 if self.merge_adapters and hasattr(model, "merge_and_unload"):
                     logger.info("Merging adapters and unloading.")
                     model = model.merge_and_unload(True)
 
-                if self.accelerator.is_main_process:
+                if is_main_process:
                     logger.info("Pushing to hub!")
 
                 model.push_to_hub = types.MethodType(push_to_hub, model)
                 model.push_to_hub(self.output_hub_repo, token=self.hf_hub_token, accelerator=self.accelerator, private=self.private_repo)
 
-            if self.accelerator.is_main_process:
+            if rank == 0:
                 logger.info("Training complete!")
 
             return self.model
         finally:
-            self.accelerator.end_training()
+            if not is_fsdp:
+                self.accelerator.end_training()
