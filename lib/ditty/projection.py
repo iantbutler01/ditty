@@ -80,9 +80,13 @@ def extract_last_hidden_state(prediction: Any) -> torch.Tensor:
 
 def resolve_output_embeddings(model: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
     real_model = getattr(model, "_orig_mod", model)
+    output_embeddings = None
     if hasattr(real_model, "get_output_embeddings"):
-        output_embeddings = real_model.get_output_embeddings()
-    else:
+        try:
+            output_embeddings = real_model.get_output_embeddings()
+        except (AttributeError, NotImplementedError):
+            output_embeddings = None
+    if output_embeddings is None:
         output_embeddings = getattr(real_model, "lm_head", None)
     if output_embeddings is None:
         raise RuntimeError(
@@ -101,9 +105,13 @@ def resolve_output_embeddings(model: Any) -> tuple[torch.Tensor, torch.Tensor | 
 
 def resolve_output_projection(model: Any):
     real_model = getattr(model, "_orig_mod", model)
+    output_embeddings = None
     if hasattr(real_model, "get_output_embeddings"):
-        output_embeddings = real_model.get_output_embeddings()
-    else:
+        try:
+            output_embeddings = real_model.get_output_embeddings()
+        except (AttributeError, NotImplementedError):
+            output_embeddings = None
+    if output_embeddings is None:
         output_embeddings = getattr(real_model, "lm_head", None)
     if output_embeddings is None:
         raise RuntimeError(

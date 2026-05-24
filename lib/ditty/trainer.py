@@ -109,6 +109,19 @@ def _mean_numeric_metric_dicts(metric_rows: list[dict[str, Any]]) -> dict[str, f
     return {key: sums[key] / counts[key] for key in sorted(sums) if counts.get(key, 0) > 0}
 
 
+def _slice_batch_tensor(value: Any, start: int, end: int, batch_size: int) -> Any:
+    if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch_size:
+        return value[start:end]
+    return value
+
+
+def _slice_batch_mapping(mapping: dict[str, Any], start: int, end: int, batch_size: int) -> dict[str, Any]:
+    return {
+        key: _slice_batch_tensor(value, start, end, batch_size)
+        for key, value in mapping.items()
+    }
+
+
 def _next_checkpoint_iteration(
     *,
     local_latest_checkpoint_num: Optional[int],
@@ -510,12 +523,6 @@ class Trainer:
                         )
 
                         full_forward_kwargs = dict(ctx.get("forward_kwargs", {}))
-                        full_target = ctx.get("target")
-                        full_mask = ctx.get("mask")
-                        full_old_logprobs = ctx.get("old_logprobs")
-                        full_advantages = ctx.get("advantages")
-                        full_reference_logprobs = ctx.get("reference_logprobs")
-                        full_attention_mask = full_forward_kwargs.get("attention_mask")
                         total_loss_scalar = 0.0
                         last_loss_output = None
                         micro_metric_rows: list[dict[str, Any]] = []
@@ -529,25 +536,20 @@ class Trainer:
                                 # the loss contribution is explicitly zeroed below.
                                 s, e = batch_size_total - 1, batch_size_total
                             chunk_batch = batch[s:e]
-                            chunk_fwd_kwargs = dict(full_forward_kwargs)
-                            if full_attention_mask is not None and hasattr(full_attention_mask, "shape"):
-                                chunk_fwd_kwargs["attention_mask"] = full_attention_mask[s:e]
-                            chunk_ctx = dict(ctx)
+                            chunk_fwd_kwargs = _slice_batch_mapping(
+                                full_forward_kwargs,
+                                s,
+                                e,
+                                batch_size_total,
+                            )
+                            chunk_ctx = _slice_batch_mapping(ctx, s, e, batch_size_total)
                             chunk_ctx["forward_kwargs"] = chunk_fwd_kwargs
-                            if full_target is not None and hasattr(full_target, "shape"):
-                                chunk_ctx["target"] = full_target[s:e]
-                            if full_mask is not None and hasattr(full_mask, "shape"):
-                                chunk_ctx["mask"] = full_mask[s:e]
+                            if "mask" in chunk_ctx and isinstance(chunk_ctx["mask"], torch.Tensor):
                                 if not has_real_rows:
                                     chunk_ctx["mask"] = torch.zeros_like(chunk_ctx["mask"])
-                            if full_old_logprobs is not None and hasattr(full_old_logprobs, "shape"):
-                                chunk_ctx["old_logprobs"] = full_old_logprobs[s:e]
-                            if full_advantages is not None and hasattr(full_advantages, "shape"):
-                                chunk_ctx["advantages"] = full_advantages[s:e]
+                            if "advantages" in chunk_ctx and isinstance(chunk_ctx["advantages"], torch.Tensor):
                                 if not has_real_rows:
                                     chunk_ctx["advantages"] = torch.zeros_like(chunk_ctx["advantages"])
-                            if full_reference_logprobs is not None and hasattr(full_reference_logprobs, "shape"):
-                                chunk_ctx["reference_logprobs"] = full_reference_logprobs[s:e]
                             with context_manager:
                                 model_output = self.model(chunk_batch, **chunk_fwd_kwargs)
                                 if not isinstance(model_output, tuple):

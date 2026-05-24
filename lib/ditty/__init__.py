@@ -9,7 +9,17 @@ from .contract import (
     format_pipeline_contracts,
 )
 from . import diffusion
-from .loss import LossCalculator, LossOutput, MSELoss, L1Loss, CrossEntropyLoss, CompositeLoss
+from .loss import (
+    LossCalculator,
+    LossOutput,
+    MSELoss,
+    L1Loss,
+    CrossEntropyLoss,
+    FusedLinearCrossEntropyLoss,
+    MTPAuxFusedCrossEntropyLoss,
+    CompositeLoss,
+    fused_linear_cross_entropy,
+)
 from .loss import GRPOLoss
 from .processors import PreProcessor, PostProcessor, Context
 from .checkpoint import CheckpointManager, Checkpoint
@@ -82,6 +92,7 @@ except ModuleNotFoundError as exc:
 try:
     from .model_factory import (
         CausalLMBackboneTransform,
+        ChainedModelTransform,
         ModelConfig,
         ModelFactory,
         TokenizerFactory,
@@ -92,6 +103,7 @@ try:
     )
 except ModuleNotFoundError as exc:
     CausalLMBackboneTransform = _missing_optional_export("CausalLMBackboneTransform", exc)
+    ChainedModelTransform = _missing_optional_export("ChainedModelTransform", exc)
     ModelConfig = _missing_optional_export("ModelConfig", exc)
     ModelFactory = _missing_optional_export("ModelFactory", exc)
     TokenizerFactory = _missing_optional_export("TokenizerFactory", exc)
@@ -99,6 +111,11 @@ except ModuleNotFoundError as exc:
     QuantConfig = _missing_optional_export("QuantConfig", exc)
     PeftConfig = _missing_optional_export("PeftConfig", exc)
     ModelTransform = _missing_optional_export("ModelTransform", exc)
+
+try:
+    from .models import Step3p5ForMTPTraining
+except ModuleNotFoundError as exc:
+    Step3p5ForMTPTraining = _missing_optional_export("Step3p5ForMTPTraining", exc)
 
 try:
     from .example import print_pipeline
@@ -133,6 +150,9 @@ __all__ = [
     "MSELoss",
     "L1Loss",
     "CrossEntropyLoss",
+    "FusedLinearCrossEntropyLoss",
+    "MTPAuxFusedCrossEntropyLoss",
+    "fused_linear_cross_entropy",
     "GRPOLoss",
     "CompositeLoss",
     "PreProcessor",
@@ -141,6 +161,8 @@ __all__ = [
     "ModelFactory",
     "ModelConfig",
     "CausalLMBackboneTransform",
+    "ChainedModelTransform",
+    "Step3p5ForMTPTraining",
     "TokenizerFactory",
     "FSDPConfig",
     "QuantConfig",

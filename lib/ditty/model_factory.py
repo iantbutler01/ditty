@@ -27,6 +27,18 @@ class ModelTransform:
         raise NotImplementedError
 
 
+class ChainedModelTransform(ModelTransform):
+    """Apply multiple model transforms in order."""
+
+    def __init__(self, *transforms: Optional[ModelTransform]):
+        self.transforms = [transform for transform in transforms if transform is not None]
+
+    def transform(self, model: nn.Module) -> nn.Module:
+        for transform in self.transforms:
+            model = transform.transform(model)
+        return model
+
+
 class CausalLMBackboneTransform(ModelTransform):
     """Patch HF causal LM forward to return backbone outputs instead of dense vocab logits."""
 
@@ -48,13 +60,18 @@ class CausalLMBackboneTransform(ModelTransform):
     @staticmethod
     def _resolve_decoder(model: nn.Module) -> nn.Module:
         if hasattr(model, "get_decoder"):
-            decoder = model.get_decoder()
-            if decoder is not None:
-                return decoder
+            try:
+                decoder = model.get_decoder()
+                if decoder is not None:
+                    return decoder
+            except (AttributeError, NotImplementedError):
+                pass
         real_model = getattr(model, "_orig_mod", model)
         base_model_prefix = getattr(real_model, "base_model_prefix", None)
         if base_model_prefix and hasattr(real_model, base_model_prefix):
             return getattr(real_model, base_model_prefix)
+        if hasattr(real_model, "base_model"):
+            return real_model.base_model
         if hasattr(real_model, "model"):
             return real_model.model
         raise RuntimeError(
