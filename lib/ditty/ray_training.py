@@ -114,6 +114,17 @@ def _parse_env(values: Sequence[str]) -> dict[str, str]:
     return env
 
 
+def _parse_env_inherit(values: Sequence[str]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in values:
+        key = str(key)
+        if not key:
+            raise ValueError("Expected non-empty env key for --env-inherit")
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
 def _runtime_env_with_env_vars(
     runtime_env: dict[str, Any] | None,
     env: dict[str, str],
@@ -512,6 +523,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-env-json", default=None)
     parser.add_argument("--working-dir", default=None)
     parser.add_argument("--env", action="append", default=[], help="Environment override as KEY=VALUE; may be repeated")
+    parser.add_argument("--env-inherit", action="append", default=[], help="Inherit KEY from the parent environment if set")
     parser.add_argument("--ray-train-storage-path", default=None)
     parser.add_argument("--ray-train-run-name", default=None)
     parser.add_argument("--ray-train-max-failures", type=int, default=0)
@@ -541,7 +553,7 @@ def config_from_args(args: argparse.Namespace) -> RayModuleLaunchConfig:
         master_port=args.master_port,
         ray_address=args.ray_address,
         runtime_env=runtime_env,
-        env=_parse_env(args.env),
+        env={**_parse_env(args.env), **_parse_env_inherit(args.env_inherit)},
     )
 
 
@@ -567,7 +579,7 @@ def ray_train_config_from_args(args: argparse.Namespace) -> RayTrainModuleLaunch
         run_name=args.ray_train_run_name,
         ray_address=args.ray_address,
         runtime_env=runtime_env,
-        env=_parse_env(args.env),
+        env={**_parse_env(args.env), **_parse_env_inherit(args.env_inherit)},
         restore_checkpoint_to=args.restore_checkpoint_to,
     )
 
