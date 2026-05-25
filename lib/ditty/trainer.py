@@ -352,7 +352,7 @@ class Trainer:
             _dist_debug(
                 "skipping checkpoint save because the distributed process group is no longer initialized"
             )
-            return
+            return None
 
         if self._is_main_process():
             logger.info(f"Saving checkpoint at step {self.state.steps} (total: {self.state.total_steps})")
@@ -369,7 +369,7 @@ class Trainer:
                     "Skipping checkpoint save because distributed synchronization is unavailable: %s",
                     error,
                 )
-            return
+            return None
         _dist_debug("passed wait_for_everyone before checkpoint save")
 
         self.checkpoint_manager.save(
@@ -401,7 +401,7 @@ class Trainer:
                         error,
                     )
                 self._checkpoint_iteration += 1
-                return
+                return checkpoint_num
 
             self.checkpoint_manager.report_to_ray_train(
                 checkpoint_num=checkpoint_num,
@@ -422,6 +422,35 @@ class Trainer:
         _dist_debug(f"checkpoint save completed for checkpoint_num={checkpoint_num}")
         self._last_checkpoint_total_steps = self.state.total_steps
         self._checkpoint_iteration += 1
+        return checkpoint_num
+
+    def _save_and_notify(self, ctx: Optional[dict[str, Any]] = None, *, reason: str = "periodic"):
+        checkpoint_num = self._save()
+        if checkpoint_num is None:
+            return None
+        checkpoint_path = self.checkpoint_manager.get_checkpoint_path(checkpoint_num)
+        payload = {
+            "checkpoint_num": int(checkpoint_num),
+            "checkpoint_path": checkpoint_path,
+            "reason": str(reason),
+            "training_state": self.state.state_dict(),
+            "output_dir": self.output_dir,
+        }
+        for component in [*self.preprocessors, *self.postprocessors, self.loss_calculator]:
+            hook = getattr(component, "on_checkpoint_saved", None)
+            if not callable(hook):
+                continue
+            try:
+                hook(payload, ctx or {})
+            except BaseException as error:
+                if self._is_main_process():
+                    logger.warning(
+                        "Checkpoint hook failed for %s after checkpoint_%s: %s",
+                        component.__class__.__name__,
+                        checkpoint_num,
+                        error,
+                    )
+        return checkpoint_num
 
     def _should_skip_final_checkpoint(self) -> bool:
         return (
@@ -728,9 +757,25 @@ class Trainer:
                     stop_requested = True
                     break
 
-                if self.checkpoint_every > 0 and self.state.steps % self.checkpoint_every == 0:
+                forced_checkpoint = bool(ctx.get("force_checkpoint_after_step"))
+                saved_checkpoint = False
+                if forced_checkpoint:
+                    _dist_debug(
+                        "triggering forced checkpoint at "
+                        f"step={self.state.steps} reason={ctx.get('checkpoint_reason', 'requested')}"
+                    )
+                    saved_checkpoint = self._save_and_notify(
+                        ctx,
+                        reason=str(ctx.get("checkpoint_reason") or "requested"),
+                    ) is not None
+
+                if (
+                    self.checkpoint_every > 0
+                    and self.state.steps % self.checkpoint_every == 0
+                    and not saved_checkpoint
+                ):
                     _dist_debug(f"triggering periodic checkpoint at step={self.state.steps}")
-                    self._save()
+                    self._save_and_notify(ctx, reason="periodic")
 
                 if max_steps is not None and self.state.total_steps >= max_steps:
                     stop_requested = True
@@ -758,7 +803,7 @@ class Trainer:
                 self._wait_for_everyone()
             else:
                 _dist_debug("training loop complete, invoking final _save()")
-                self._save()
+                self._save_and_notify(reason="final")
                 _dist_debug("final _save() returned")
         else:
             _dist_debug("training loop complete, final checkpoint disabled")

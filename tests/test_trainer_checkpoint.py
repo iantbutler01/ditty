@@ -47,6 +47,47 @@ class TrainerCheckpointTests(unittest.TestCase):
 
         self.assertEqual(calls, ["pre", "post", "loss"])
 
+    def test_save_and_notify_calls_checkpoint_hooks_with_payload(self):
+        calls = []
+
+        class State:
+            total_steps = 12
+
+            def state_dict(self):
+                return {"steps": 3, "total_steps": 12}
+
+        class CheckpointManager:
+            def get_checkpoint_path(self, checkpoint_num):
+                return f"/tmp/checkpoints/checkpoint_{checkpoint_num}"
+
+        class Hook:
+            def __init__(self, name):
+                self.name = name
+
+            def on_checkpoint_saved(self, checkpoint, ctx):
+                calls.append((self.name, dict(checkpoint), dict(ctx)))
+
+        trainer = object.__new__(Trainer)
+        trainer.state = State()
+        trainer.output_dir = "/tmp/run"
+        trainer.checkpoint_manager = CheckpointManager()
+        trainer.preprocessors = [Hook("pre")]
+        trainer.postprocessors = [object(), Hook("post")]
+        trainer.loss_calculator = Hook("loss")
+        trainer._save = lambda: 7
+        trainer._is_main_process = lambda: True
+
+        result = trainer._save_and_notify({"force_checkpoint_after_step": True}, reason="curriculum_gate")
+
+        self.assertEqual(result, 7)
+        self.assertEqual([name for name, _checkpoint, _ctx in calls], ["pre", "post", "loss"])
+        for _name, checkpoint, ctx in calls:
+            self.assertEqual(checkpoint["checkpoint_num"], 7)
+            self.assertEqual(checkpoint["checkpoint_path"], "/tmp/checkpoints/checkpoint_7")
+            self.assertEqual(checkpoint["reason"], "curriculum_gate")
+            self.assertEqual(checkpoint["training_state"]["total_steps"], 12)
+            self.assertTrue(ctx["force_checkpoint_after_step"])
+
     def test_resume_checkpoint_iteration_uses_loaded_checkpoint_num(self):
         self.assertEqual(
             _next_checkpoint_iteration(
