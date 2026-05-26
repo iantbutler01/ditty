@@ -26,6 +26,7 @@ from .grpo import GRPOConfig, compute_grpo_loss
 from .projection import extract_last_hidden_state
 from .projection import materialize_model_tensor
 from .projection import resolve_output_embeddings
+from .projection import resolve_output_projection
 from .processors import Context
 
 # Optional imports for memory-efficient CE
@@ -69,6 +70,7 @@ def fused_linear_cross_entropy(
     ignore_index: int = -100,
     include_padding_in_normalization: bool = False,
     chunk_size: int = 4096,
+    output_projection: nn.Module | None = None,
 ) -> torch.Tensor:
     """Compute linear projection + cross entropy without materializing full logits."""
 
@@ -108,6 +110,7 @@ def fused_linear_cross_entropy(
                 ignore_index=ignore_index,
                 include_padding_in_normalization=include_padding_in_normalization,
                 chunk_size=chunk_size,
+                output_projection=output_projection,
             )
         loss = linear_cross_entropy(
             hidden,
@@ -130,7 +133,20 @@ def fused_linear_cross_entropy(
         ignore_index=ignore_index,
         include_padding_in_normalization=include_padding_in_normalization,
         chunk_size=chunk_size,
+        output_projection=output_projection,
     )
+
+
+def _is_float8_backed_tensor(value: Any) -> bool:
+    tensor = value
+    if hasattr(tensor, "_tensor"):
+        tensor = getattr(tensor, "_tensor")
+    if isinstance(tensor, torch.Tensor) and tensor.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+        return True
+    data = getattr(tensor, "data", None)
+    if isinstance(data, torch.Tensor) and data.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+        return True
+    return False
 
 
 def _chunked_linear_cross_entropy(
@@ -140,6 +156,7 @@ def _chunked_linear_cross_entropy(
     *,
     bias: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
+    output_projection: nn.Module | None = None,
     ignore_index: int = -100,
     include_padding_in_normalization: bool = False,
     chunk_size: int = 4096,
@@ -154,7 +171,12 @@ def _chunked_linear_cross_entropy(
         t_chunk = target[start:end]
         m_chunk = mask[start:end] if mask is not None else None
 
-        logits_chunk = F.linear(h_chunk, weight, bias)
+        if output_projection is not None:
+            logits_chunk = output_projection(h_chunk)
+        else:
+            logits_chunk = F.linear(h_chunk, weight, bias)
+        if logits_chunk.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            logits_chunk = logits_chunk.float()
         if m_chunk is not None:
             loss_chunk = F.cross_entropy(
                 logits_chunk,
@@ -498,15 +520,20 @@ class FusedLinearCrossEntropyLoss(LossCalculator):
                 "or a model in ctx exposing output embeddings."
             )
 
+        output_projection = None
+        if model is not None and _is_float8_backed_tensor(weight):
+            output_projection = resolve_output_projection(model)
+
         loss = fused_linear_cross_entropy(
             hidden,
             weight,
             target,
             bias=bias,
             mask=mask,
-            backend=self.backend,
+            backend="chunked" if output_projection is not None else self.backend,
             ignore_index=self.ignore_index,
             include_padding_in_normalization=self.include_padding_in_normalization,
+            output_projection=output_projection,
         )
 
         return LossOutput(loss=loss, metrics={"ce": loss.item()})

@@ -108,6 +108,14 @@ def _mean_numeric_metric_dicts(metric_rows: list[dict[str, Any]]) -> dict[str, f
     return {key: sums[key] / counts[key] for key in sorted(sums) if counts.get(key, 0) > 0}
 
 
+def _precompute_float8_fsdp_scales_if_available(model: nn.Module) -> None:
+    try:
+        from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+    except (ImportError, AttributeError):
+        return
+    precompute_float8_dynamic_scale_for_fsdp(model)
+
+
 def _numel_if_tensor(value: Any) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.numel())
@@ -796,6 +804,8 @@ class Trainer:
                     batch_loss = loss.item()
                     if should_step_optimizer:
                         self.optimizer.step()
+                        if self.is_fsdp and getattr(self.model, "_ditty_float8_training_enabled", False):
+                            _precompute_float8_fsdp_scales_if_available(self.model)
                         if self.use_scheduler and self.scheduler:
                             self.scheduler.step()
                         self.optimizer.zero_grad(set_to_none=True)

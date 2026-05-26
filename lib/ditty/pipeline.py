@@ -37,6 +37,161 @@ MUON_ADAMW_NAME_FRAGMENTS = (
 )
 
 
+_TORCHAO_OPTIM_VIEW_DTYPE_PATCHED = False
+
+
+def _register_torchao_optim_view_dtype_handlers() -> None:
+    """Teach TorchAO quantized optimizer states how to handle Dynamo's dtype view op."""
+    global _TORCHAO_OPTIM_VIEW_DTYPE_PATCHED
+    if _TORCHAO_OPTIM_VIEW_DTYPE_PATCHED:
+        return
+    try:
+        from torchao.optim.subclass_8bit import OptimState8bit
+        from torchao.optim.subclass_fp8 import OptimStateFp8
+    except (ImportError, AttributeError):
+        return
+
+    view_dtype = torch.ops.aten.view.dtype
+
+    @OptimState8bit.implements(view_dtype)
+    def _optim_state_8bit_view_dtype(func, types, args, kwargs):
+        tensor, dtype = args
+        return tensor.dequantize(output_dtype=dtype)
+
+    @OptimStateFp8.implements(view_dtype)
+    def _optim_state_fp8_view_dtype(func, types, args, kwargs):
+        tensor, dtype = args
+        return tensor.dequantize(output_dtype=dtype)
+
+    _TORCHAO_OPTIM_VIEW_DTYPE_PATCHED = True
+
+
+def _install_torchao_adam_eager_step(optimizer: torch.optim.Optimizer) -> torch.optim.Optimizer:
+    """Bypass TorchAO Adam's compiled per-parameter step for FSDP2 DTensor subclasses."""
+    from torch.distributed.tensor import DTensor
+    from torchao.optim.adam import _fp32_to_bf16_sr
+
+    def local_tensor(t: torch.Tensor) -> torch.Tensor:
+        return t.to_local() if isinstance(t, DTensor) else t
+
+    def state_to_fp32(t: torch.Tensor) -> torch.Tensor:
+        local = local_tensor(t)
+        dequantize = getattr(local, "dequantize", None)
+        if callable(dequantize) and hasattr(local, "codes") and hasattr(local, "scale"):
+            return dequantize(output_dtype=torch.float32)
+        return local.float()
+
+    def copy_state_(dst: torch.Tensor, src: torch.Tensor) -> None:
+        local_tensor(dst).copy_(src)
+
+    def adam_update_local_shard(
+        param: torch.Tensor,
+        grad: torch.Tensor,
+        step: torch.Tensor,
+        exp_avg: torch.Tensor,
+        exp_avg_sq: torch.Tensor,
+        max_exp_avg_sq: Optional[torch.Tensor],
+        lr: torch.Tensor,
+        beta1: float,
+        beta2: float,
+        weight_decay: float,
+        eps: float,
+        is_adamw: bool,
+        bf16_stochastic_round: bool,
+    ) -> None:
+        p_local = local_tensor(param.detach())
+        grad_f32 = local_tensor(grad).float()
+        p_f32 = p_local.float()
+        lr_value = float(lr.item())
+
+        if is_adamw:
+            p_f32.add_(p_f32, alpha=-(lr_value * weight_decay))
+        else:
+            grad_f32.add_(p_f32, alpha=weight_decay)
+
+        step_value = float(step.item())
+        bias_correction1 = 1 - beta1**step_value
+        bias_correction2 = 1 - beta2**step_value
+
+        exp_avg_f32 = state_to_fp32(exp_avg)
+        exp_avg_sq_f32 = state_to_fp32(exp_avg_sq)
+        exp_avg_f32.lerp_(grad_f32, 1 - beta1)
+        grad_f32.square_()
+        exp_avg_sq_f32.lerp_(grad_f32, 1 - beta2)
+        del grad_f32
+
+        copy_state_(exp_avg, exp_avg_f32)
+        copy_state_(exp_avg_sq, exp_avg_sq_f32)
+
+        if max_exp_avg_sq is not None:
+            max_exp_avg_sq_f32 = torch.maximum(state_to_fp32(max_exp_avg_sq), exp_avg_sq_f32)
+            copy_state_(max_exp_avg_sq, max_exp_avg_sq_f32)
+            denom = max_exp_avg_sq_f32.sqrt_()
+        else:
+            denom = exp_avg_sq_f32.sqrt_()
+
+        denom.div_(bias_correction2**0.5).add_(eps)
+        exp_avg_f32.div_(bias_correction1).div_(denom)
+        p_f32.add_(exp_avg_f32, alpha=-lr_value)
+
+        if bf16_stochastic_round:
+            p_local.copy_(_fp32_to_bf16_sr(p_f32))
+        else:
+            p_local.copy_(p_f32)
+
+    @torch.no_grad()
+    def eager_step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+
+                grad = param.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Sparse gradient is not supported")
+
+                state = self.state[param]
+                if len(state) == 0:
+                    state["step"] = torch.tensor(0.0)
+                    state["exp_avg"] = self._new_buffer(param, True)
+                    state["exp_avg_sq"] = self._new_buffer(param, False)
+                    if group["amsgrad"]:
+                        state["max_exp_avg_sq"] = self._new_buffer(param, False)
+
+                state["step"] += 1
+                if not isinstance(group["lr"], torch.Tensor):
+                    raise RuntimeError(
+                        "lr was changed to a non-Tensor object. If you want to update lr, "
+                        "please use optim.param_groups[0]['lr'].fill_(new_lr)"
+                    )
+
+                adam_update_local_shard(
+                    param,
+                    grad,
+                    state["step"],
+                    state["exp_avg"],
+                    state["exp_avg_sq"],
+                    state.get("max_exp_avg_sq", None),
+                    group["lr"],
+                    group["betas"][0],
+                    group["betas"][1],
+                    group["weight_decay"],
+                    group["eps"],
+                    self.is_adamw,
+                    self.bf16_stochastic_round and param.dtype is torch.bfloat16,
+                )
+
+        return loss
+
+    optimizer.step = types.MethodType(eager_step, optimizer)
+    return optimizer
+
+
 class Pipeline:
     def __init__(
         self,
@@ -59,7 +214,7 @@ class Pipeline:
         load_optimizer_checkpoint: bool = True,
         gradient_checkpointing: bool = True,
         use_8bit_optim: bool = False,
-        optim_backend: str = "torchao",  # "torch", "bnb", "torchao", "adafactor", or "muon"
+        optim_backend: str = "torchao",  # "torch", "bnb", "torchao", "adamw_fp8", "adafactor", or "muon"
         lr: float = 1e-4,
         scale_lr_by_world_size: bool = True,
         weight_decay: float = 0.01,
@@ -509,7 +664,20 @@ class Pipeline:
             )
         elif self.optim_backend == "muon":
             optimizer = self._create_muon_optimizer(model, lr)
+        elif self.optim_backend == "adamw_fp8":
+            _register_torchao_optim_view_dtype_handlers()
+            from torchao.optim import AdamWFp8
+
+            optimizer = AdamWFp8(
+                params,
+                lr=lr,
+                weight_decay=self.weight_decay,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+            )
+            optimizer = _install_torchao_adam_eager_step(optimizer)
         elif self.use_8bit_optim:
+            _register_torchao_optim_view_dtype_handlers()
             if self.optim_backend == "bnb":
                 if is_fsdp:
                     logger.warning("bitsandbytes 8-bit optimizer not compatible with FSDP2, falling back to torchao")
@@ -521,6 +689,7 @@ class Pipeline:
                         betas=(0.9, 0.999),
                         eps=1e-8,
                     )
+                    optimizer = _install_torchao_adam_eager_step(optimizer)
                 else:
                     import bitsandbytes as bnb
 
@@ -540,6 +709,7 @@ class Pipeline:
                     betas=(0.9, 0.999),
                     eps=1e-8,
                 )
+                optimizer = _install_torchao_adam_eager_step(optimizer)
             else:
                 raise ValueError(f"Unknown optim_backend: {self.optim_backend}")
         else:

@@ -81,16 +81,25 @@ class CausalLMBackboneTransform(ModelTransform):
 
 @dataclass
 class Float8TrainingTransform(ModelTransform):
-    """Convert eligible Linear modules to TorchAO Float8Linear before FSDP2."""
+    """Convert eligible dense and packed MoE matmuls to TorchAO float8 before FSDP2."""
 
     recipe_name: str = "tensorwise"
     enable_fsdp_float8_all_gather: bool = True
     pad_inner_dim: bool = True
-    skip_fqn_fragments: tuple[str, ...] = ("lm_head",)
+    force_recompute_fp8_weight_in_bwd: bool = True
+    skip_fqn_fragments: tuple[str, ...] = ()
 
     def transform(self, model: nn.Module) -> nn.Module:
         try:
             from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+            from torchao.float8.float8_linear import (
+                GemmInputRole,
+                LinearMMConfig,
+                ScaledMMConfig,
+                WeightWithDynamicFloat8CastTensor,
+                matmul_with_hp_or_float8_args,
+            )
+            from torchao.float8.float8_training_tensor import Float8TrainingTensor
         except ImportError as exc:
             raise ModuleNotFoundError(
                 "Float8TrainingTransform requires torchao.float8. Install a torchao "
@@ -101,30 +110,45 @@ class Float8TrainingTransform(ModelTransform):
             Float8LinearConfig.from_recipe_name(self.recipe_name),
             enable_fsdp_float8_all_gather=self.enable_fsdp_float8_all_gather,
             pad_inner_dim=self.pad_inner_dim,
+            force_recompute_fp8_weight_in_bwd=self.force_recompute_fp8_weight_in_bwd,
+        )
+        self._install_raw_float8_storage_support(
+            weight_wrapper_cls=WeightWithDynamicFloat8CastTensor,
+            float8_training_tensor_cls=Float8TrainingTensor,
+            gemm_input_role=GemmInputRole,
         )
 
         converted = 0
+        skipped_shape = 0
+        skipped_shape_examples: list[str] = []
 
         def module_filter_fn(module: nn.Module, fqn: str) -> bool:
-            nonlocal converted
+            nonlocal converted, skipped_shape
             if not isinstance(module, nn.Linear):
                 return True
             if any(fragment and fragment in fqn for fragment in self.skip_fqn_fragments):
                 return False
+            in_features = int(getattr(module, "in_features", 0))
+            out_features = int(getattr(module, "out_features", 0))
+            shape_supported = out_features % 16 == 0
             if not self.pad_inner_dim:
-                in_features = int(getattr(module, "in_features", 0))
-                out_features = int(getattr(module, "out_features", 0))
-                if in_features % 16 != 0 or out_features % 16 != 0:
-                    return False
+                shape_supported = shape_supported and in_features % 16 == 0
+            if not shape_supported:
+                skipped_shape += 1
+                if len(skipped_shape_examples) < 8:
+                    skipped_shape_examples.append(f"{fqn}({in_features}->{out_features})")
+                return False
             converted += 1
             return True
 
         logger.info(
             "Applying TorchAO float8 training transform: recipe=%s "
-            "fsdp_float8_all_gather=%s pad_inner_dim=%s skip=%s",
+            "fsdp_float8_all_gather=%s pad_inner_dim=%s "
+            "force_recompute_fp8_weight_in_bwd=%s skip=%s",
             self.recipe_name,
             self.enable_fsdp_float8_all_gather,
             self.pad_inner_dim,
+            self.force_recompute_fp8_weight_in_bwd,
             ",".join(self.skip_fqn_fragments),
         )
         model = convert_to_float8_training(
@@ -132,8 +156,170 @@ class Float8TrainingTransform(ModelTransform):
             module_filter_fn=module_filter_fn,
             config=config,
         )
-        logger.info("Converted %s Linear module(s) to TorchAO Float8Linear.", converted)
+        logger.info(
+            "Converted %s Linear module(s) to TorchAO Float8Linear; skipped %s shape-ineligible "
+            "Linear module(s)%s.",
+            converted,
+            skipped_shape,
+            f": {', '.join(skipped_shape_examples)}" if skipped_shape_examples else "",
+        )
+        wrapped_experts = self._wrap_packed_moe_experts(
+            model,
+            config=config,
+            linear_mm_config=LinearMMConfig(
+                ScaledMMConfig(config.emulate, config.gemm_config_output.use_fast_accum, False, config.pad_inner_dim),
+                ScaledMMConfig(config.emulate, config.gemm_config_grad_input.use_fast_accum, False, config.pad_inner_dim),
+                ScaledMMConfig(config.emulate, config.gemm_config_grad_weight.use_fast_accum, False, config.pad_inner_dim),
+            ),
+            weight_wrapper_cls=WeightWithDynamicFloat8CastTensor,
+            matmul_fn=matmul_with_hp_or_float8_args,
+        )
+        if wrapped_experts:
+            logger.info("Wrapped %s packed MoE expert module(s) for TorchAO float8 FSDP all-gather.", wrapped_experts)
+        model._ditty_float8_training_enabled = True
         return model
+
+    @staticmethod
+    def _install_raw_float8_storage_support(
+        *,
+        weight_wrapper_cls: Any,
+        float8_training_tensor_cls: Any,
+        gemm_input_role: Any,
+    ) -> None:
+        if getattr(weight_wrapper_cls, "_ditty_raw_float8_storage_patch", False):
+            return
+
+        original_pre_all_gather = weight_wrapper_cls.fsdp_pre_all_gather
+        original_post_all_gather = weight_wrapper_cls.fsdp_post_all_gather
+        float8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+
+        def fsdp_pre_all_gather(self, mesh):
+            tensor = getattr(self, "_tensor", None)
+            if isinstance(tensor, torch.Tensor) and tensor.dtype in float8_dtypes:
+                scale = torch.ones((), device=tensor.device, dtype=torch.float32)
+                return (tensor,), (scale,)
+            return original_pre_all_gather(self, mesh)
+
+        def fsdp_post_all_gather(self, all_gather_outputs, metadata, param_dtype, *, out=None):
+            tensor = getattr(self, "_tensor", None)
+            if not (isinstance(tensor, torch.Tensor) and tensor.dtype in float8_dtypes):
+                return original_post_all_gather(self, all_gather_outputs, metadata, param_dtype, out=out)
+
+            (data,) = all_gather_outputs
+            (scale,) = metadata
+            if out is not None:
+                from torch.distributed._tensor import DTensor
+
+                if isinstance(out, float8_training_tensor_cls):
+                    out._data = data
+                    out._scale = scale
+                elif isinstance(out, DTensor) and isinstance(out._local_tensor, float8_training_tensor_cls):
+                    out._local_tensor._data = data
+                    out._local_tensor._scale = scale
+                else:
+                    raise RuntimeError(
+                        "raw-FP8 FSDP post-all-gather expected Float8TrainingTensor output, "
+                        f"got {type(out).__name__}"
+                    )
+                return
+
+            return float8_training_tensor_cls(
+                data,
+                scale,
+                param_dtype,
+                self._linear_mm_config,
+                gemm_input_role.WEIGHT,
+            ), (data,)
+
+        weight_wrapper_cls.fsdp_pre_all_gather = fsdp_pre_all_gather
+        weight_wrapper_cls.fsdp_post_all_gather = fsdp_post_all_gather
+        weight_wrapper_cls._ditty_raw_float8_storage_patch = True
+
+    @staticmethod
+    def _wrap_packed_moe_experts(
+        model: nn.Module,
+        *,
+        config: Any,
+        linear_mm_config: Any,
+        weight_wrapper_cls: Any,
+        matmul_fn: Any,
+    ) -> int:
+        wrapped = 0
+        for module in model.modules():
+            gate_up_proj = getattr(module, "gate_up_proj", None)
+            down_proj = getattr(module, "down_proj", None)
+            if not isinstance(gate_up_proj, nn.Parameter) or not isinstance(down_proj, nn.Parameter):
+                continue
+            if gate_up_proj.dim() != 3 or down_proj.dim() != 3:
+                continue
+            if getattr(module, "_ditty_float8_packed_moe_wrapped", False):
+                continue
+
+            module.gate_up_proj = nn.Parameter(
+                weight_wrapper_cls(
+                    gate_up_proj,
+                    linear_mm_config,
+                    config.cast_config_weight.target_dtype,
+                ),
+                requires_grad=gate_up_proj.requires_grad,
+            )
+            module.down_proj = nn.Parameter(
+                weight_wrapper_cls(
+                    down_proj,
+                    linear_mm_config,
+                    config.cast_config_weight.target_dtype,
+                ),
+                requires_grad=down_proj.requires_grad,
+            )
+            module._ditty_float8_expert_config = config
+            module._ditty_float8_expert_linear_mm_config = linear_mm_config
+            module._ditty_float8_expert_matmul = matmul_fn
+            module._ditty_float8_packed_moe_wrapped = True
+            module.forward = types.MethodType(_float8_packed_moe_experts_forward, module)
+            wrapped += 1
+        return wrapped
+
+
+def _float8_packed_moe_experts_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    final_hidden_states = torch.zeros_like(hidden_states)
+    num_experts = int(getattr(self, "num_experts"))
+    with torch.no_grad():
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    matmul = self._ditty_float8_expert_matmul
+    mm_config = self._ditty_float8_expert_linear_mm_config
+    config = self._ditty_float8_expert_config
+
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        expert_i = int(expert_idx.item())
+        if expert_i == num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        gate_up_weight = self.gate_up_proj[expert_i : expert_i + 1].reshape(
+            self.gate_up_proj.shape[1],
+            self.gate_up_proj.shape[2],
+        )
+        gate_up = matmul.apply(current_state, gate_up_weight.t(), mm_config, config)
+        gate, up = gate_up.chunk(2, dim=-1)
+        current_hidden_states = self.act_fn(gate) * up
+        down_weight = self.down_proj[expert_i : expert_i + 1].reshape(
+            self.down_proj.shape[1],
+            self.down_proj.shape[2],
+        )
+        current_hidden_states = matmul.apply(current_hidden_states, down_weight.t(), mm_config, config)
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+    return final_hidden_states
 
 
 @dataclass
