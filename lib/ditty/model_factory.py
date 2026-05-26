@@ -176,6 +176,9 @@ class Float8TrainingTransform(ModelTransform):
         )
         if wrapped_experts:
             logger.info("Wrapped %s packed MoE expert module(s) for TorchAO float8 FSDP all-gather.", wrapped_experts)
+        patched_masks = _patch_float8_unsafe_causal_mask_builders(model)
+        if patched_masks:
+            logger.info("Patched %s FP8-unsafe causal-mask builder(s).", patched_masks)
         model._ditty_float8_training_enabled = True
         return model
 
@@ -320,6 +323,54 @@ def _float8_packed_moe_experts_forward(
         final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
     return final_hidden_states
+
+
+def _shape_only_tensor_like(tensor: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    """Return a tiny-storage tensor with the same shape/device for shape-only model helpers."""
+
+    shape = tuple(tensor.shape)
+    if not shape:
+        return torch.empty((), device=tensor.device, dtype=dtype)
+    base = torch.empty((), device=tensor.device, dtype=dtype)
+    return torch.as_strided(base, shape, tuple(0 for _ in shape))
+
+
+def _patch_float8_unsafe_causal_mask_builders(
+    model: nn.Module,
+    *,
+    mask_dtype: torch.dtype = torch.float32,
+) -> int:
+    """Keep model-specific causal-mask construction off FP8 control tensors."""
+
+    float8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+    patched = 0
+    for module in model.modules():
+        if getattr(module, "_ditty_float8_causal_mask_patch", False):
+            continue
+        update_causal_mask = getattr(module, "_update_causal_mask", None)
+        if not callable(update_causal_mask):
+            continue
+        module_type = f"{module.__class__.__module__}.{module.__class__.__name__}".lower()
+        if "nemotron" not in module_type:
+            continue
+
+        def wrapped_update_causal_mask(
+            self,
+            attention_mask,
+            input_tensor,
+            cache_position,
+            *,
+            _original=update_causal_mask,
+        ):
+            if isinstance(input_tensor, torch.Tensor) and input_tensor.dtype in float8_dtypes:
+                input_tensor = _shape_only_tensor_like(input_tensor, dtype=mask_dtype)
+            return _original(attention_mask, input_tensor, cache_position)
+
+        module._ditty_original_update_causal_mask = update_causal_mask
+        module._update_causal_mask = types.MethodType(wrapped_update_causal_mask, module)
+        module._ditty_float8_causal_mask_patch = True
+        patched += 1
+    return patched
 
 
 @dataclass
