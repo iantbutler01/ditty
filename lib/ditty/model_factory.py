@@ -1,6 +1,6 @@
 import os
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from logging import getLogger
 from typing import Optional, List, Type, Dict, Any, Union
@@ -77,6 +77,63 @@ class CausalLMBackboneTransform(ModelTransform):
         raise RuntimeError(
             f"Could not resolve decoder/backbone module for model {type(real_model).__name__}."
         )
+
+
+@dataclass
+class Float8TrainingTransform(ModelTransform):
+    """Convert eligible Linear modules to TorchAO Float8Linear before FSDP2."""
+
+    recipe_name: str = "tensorwise"
+    enable_fsdp_float8_all_gather: bool = True
+    pad_inner_dim: bool = True
+    skip_fqn_fragments: tuple[str, ...] = ("lm_head",)
+
+    def transform(self, model: nn.Module) -> nn.Module:
+        try:
+            from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        except ImportError as exc:
+            raise ModuleNotFoundError(
+                "Float8TrainingTransform requires torchao.float8. Install a torchao "
+                "build compatible with the active PyTorch/CUDA stack."
+            ) from exc
+
+        config = replace(
+            Float8LinearConfig.from_recipe_name(self.recipe_name),
+            enable_fsdp_float8_all_gather=self.enable_fsdp_float8_all_gather,
+            pad_inner_dim=self.pad_inner_dim,
+        )
+
+        converted = 0
+
+        def module_filter_fn(module: nn.Module, fqn: str) -> bool:
+            nonlocal converted
+            if not isinstance(module, nn.Linear):
+                return True
+            if any(fragment and fragment in fqn for fragment in self.skip_fqn_fragments):
+                return False
+            if not self.pad_inner_dim:
+                in_features = int(getattr(module, "in_features", 0))
+                out_features = int(getattr(module, "out_features", 0))
+                if in_features % 16 != 0 or out_features % 16 != 0:
+                    return False
+            converted += 1
+            return True
+
+        logger.info(
+            "Applying TorchAO float8 training transform: recipe=%s "
+            "fsdp_float8_all_gather=%s pad_inner_dim=%s skip=%s",
+            self.recipe_name,
+            self.enable_fsdp_float8_all_gather,
+            self.pad_inner_dim,
+            ",".join(self.skip_fqn_fragments),
+        )
+        model = convert_to_float8_training(
+            model,
+            module_filter_fn=module_filter_fn,
+            config=config,
+        )
+        logger.info("Converted %s Linear module(s) to TorchAO Float8Linear.", converted)
+        return model
 
 
 @dataclass

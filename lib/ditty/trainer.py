@@ -108,6 +108,84 @@ def _mean_numeric_metric_dicts(metric_rows: list[dict[str, Any]]) -> dict[str, f
     return {key: sums[key] / counts[key] for key in sorted(sums) if counts.get(key, 0) > 0}
 
 
+def _numel_if_tensor(value: Any) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.numel())
+    return 0.0
+
+
+def _sum_if_tensor(value: Any) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().sum().item())
+    return 0.0
+
+
+def _batch_rows(value: Any) -> float:
+    if isinstance(value, torch.Tensor) and value.dim() > 0:
+        return float(value.shape[0])
+    if isinstance(value, dict):
+        for item in value.values():
+            rows = _batch_rows(item)
+            if rows > 0:
+                return rows
+    if isinstance(value, (list, tuple)) and value:
+        return float(len(value))
+    return 0.0
+
+
+def _training_perf_metrics(
+    *,
+    batch: Any,
+    ctx: Context,
+    elapsed_seconds: float,
+    device: torch.device,
+) -> dict[str, float]:
+    rows = _batch_rows(batch)
+    input_ids = ctx.get("input_ids", batch)
+    padded_tokens = _numel_if_tensor(input_ids)
+    forward_kwargs = ctx.get("forward_kwargs", {})
+    attention_mask = (
+        forward_kwargs.get("attention_mask")
+        if isinstance(forward_kwargs, dict)
+        else None
+    )
+    input_tokens = _sum_if_tensor(attention_mask) or padded_tokens
+    target_tokens = _sum_if_tensor(ctx.get("mask"))
+
+    counts = torch.tensor(
+        [rows, padded_tokens, input_tokens, target_tokens],
+        device=device,
+        dtype=torch.float64,
+    )
+    elapsed = torch.tensor(
+        [max(float(elapsed_seconds), 0.0)],
+        device=device,
+        dtype=torch.float64,
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(elapsed, op=torch.distributed.ReduceOp.MAX)
+
+    step_seconds = max(float(elapsed.item()), 1e-12)
+    global_rows, global_padded_tokens, global_input_tokens, global_target_tokens = (
+        float(counts[0].item()),
+        float(counts[1].item()),
+        float(counts[2].item()),
+        float(counts[3].item()),
+    )
+    return {
+        "perf_step_seconds": step_seconds,
+        "perf_global_rows": global_rows,
+        "perf_global_padded_tokens": global_padded_tokens,
+        "perf_global_input_tokens": global_input_tokens,
+        "perf_global_target_tokens": global_target_tokens,
+        "perf_rows_per_second": global_rows / step_seconds,
+        "perf_padded_tokens_per_second": global_padded_tokens / step_seconds,
+        "perf_input_tokens_per_second": global_input_tokens / step_seconds,
+        "perf_target_tokens_per_second": global_target_tokens / step_seconds,
+    }
+
+
 def _slice_batch_tensor(value: Any, start: int, end: int, batch_size: int) -> Any:
     if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch_size:
         return value[start:end]
@@ -541,7 +619,9 @@ class Trainer:
                 total_batches = None
         start_time = time.time()
 
-        atexit.register(self._save)
+        register_atexit_save = self.save_final_checkpoint or self.checkpoint_every > 0
+        if register_atexit_save:
+            atexit.register(self._save)
 
         stop_requested = False
         for ep in range(self.state.epoch, epochs):
@@ -561,6 +641,7 @@ class Trainer:
             for batch_idx, batch in enumerate(dataset):
                 if batch is None:
                     break
+                step_start_time = time.perf_counter()
 
                 if self._manual_device_placement:
                     batch = send_to_device(batch, self.device, non_blocking=True)
@@ -719,6 +800,14 @@ class Trainer:
                             self.scheduler.step()
                         self.optimizer.zero_grad(set_to_none=True)
 
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                    perf_metrics = _training_perf_metrics(
+                        batch=batch,
+                        ctx=ctx,
+                        elapsed_seconds=time.perf_counter() - step_start_time,
+                        device=self.device,
+                    )
                     time_elapsed = time.time() - start_time
                     current_epoch_decimal, batch_info, progress_info = _format_progress_state(
                         total_batches=total_batches,
@@ -728,9 +817,9 @@ class Trainer:
                         time_elapsed=time_elapsed,
                     )
 
-                    log_metrics = loss_output.metrics
+                    log_metrics = {**loss_output.metrics, **perf_metrics}
                     if completed_step % self.log_every == 0:
-                        log_metrics = _distributed_mean_metrics(loss_output.metrics)
+                        log_metrics = _distributed_mean_metrics(log_metrics)
 
                     if completed_step % self.log_every == 0 and self._is_main_process():
                         metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in log_metrics.items())
@@ -790,7 +879,8 @@ class Trainer:
             self.state.epoch += 1
             self.state.steps = 0
 
-        atexit.unregister(self._save)
+        if register_atexit_save:
+            atexit.unregister(self._save)
         if self.save_final_checkpoint:
             if self._should_skip_final_checkpoint():
                 _dist_debug("training loop complete, skipping duplicate final checkpoint")

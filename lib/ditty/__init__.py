@@ -93,6 +93,7 @@ try:
     from .model_factory import (
         CausalLMBackboneTransform,
         ChainedModelTransform,
+        Float8TrainingTransform,
         ModelConfig,
         ModelFactory,
         TokenizerFactory,
@@ -104,6 +105,7 @@ try:
 except ModuleNotFoundError as exc:
     CausalLMBackboneTransform = _missing_optional_export("CausalLMBackboneTransform", exc)
     ChainedModelTransform = _missing_optional_export("ChainedModelTransform", exc)
+    Float8TrainingTransform = _missing_optional_export("Float8TrainingTransform", exc)
     ModelConfig = _missing_optional_export("ModelConfig", exc)
     ModelFactory = _missing_optional_export("ModelFactory", exc)
     TokenizerFactory = _missing_optional_export("TokenizerFactory", exc)
@@ -162,6 +164,7 @@ __all__ = [
     "ModelConfig",
     "CausalLMBackboneTransform",
     "ChainedModelTransform",
+    "Float8TrainingTransform",
     "Step3p5ForMTPTraining",
     "TokenizerFactory",
     "FSDPConfig",
