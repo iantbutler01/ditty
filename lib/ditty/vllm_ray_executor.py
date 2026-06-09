@@ -18,6 +18,14 @@ from vllm.v1.executor.ray_executor import RayDistributedExecutor
 class DittyRayDistributedExecutor(RayDistributedExecutor):
     """Ray executor that can pin vLLM workers to an explicit CUDA device list."""
 
+    def _init_executor(self) -> None:
+        # vLLM derives ParallelConfig.use_ray from the backend selector string.
+        # A custom RayDistributedExecutor subclass still needs the flag set for
+        # vLLM v1's compiled DAG execution path.
+        if isinstance(self.parallel_config.distributed_executor_backend, str):
+            self.parallel_config.distributed_executor_backend = type(self)
+        super()._init_executor()
+
     def _update_noset_device_env_vars(self, ray_remote_kwargs):
         ray_remote_kwargs = super()._update_noset_device_env_vars(ray_remote_kwargs)
         visible_devices = os.environ.get("DITTY_VLLM_CUDA_VISIBLE_DEVICES")

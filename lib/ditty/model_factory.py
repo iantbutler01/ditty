@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import safetensors
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer, BitsAndBytesConfig
 from transformers.utils import hub, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from accelerate import init_empty_weights
@@ -371,6 +372,25 @@ def _patch_float8_unsafe_causal_mask_builders(
         module._ditty_float8_causal_mask_patch = True
         patched += 1
     return patched
+
+
+def _enable_router_logits_for_moe(model: nn.Module) -> None:
+    """Enable HF MoE router logits so losses can include the router aux term."""
+
+    seen: set[int] = set()
+    for owner in (
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+        getattr(getattr(model, "model", None), "language_model", None),
+    ):
+        config = getattr(owner, "config", None) if owner is not None else None
+        for cfg in (config, getattr(config, "text_config", None) if config is not None else None):
+            if cfg is None or id(cfg) in seen:
+                continue
+            seen.add(id(cfg))
+            if hasattr(cfg, "output_router_logits") or hasattr(cfg, "router_aux_loss_coef"):
+                cfg.output_router_logits = True
 
 
 @dataclass
@@ -800,11 +820,13 @@ class ModelFactory:
                 elif self.quant_config.bits == 8:
                     bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
-            return self._model_class.from_pretrained(
+            model = self._model_class.from_pretrained(
                 self._model_path,
                 quantization_config=bnb_config,
                 **self._load_kwargs,
             )
+            _enable_router_logits_for_moe(model)
+            return model
 
         # For custom model classes, create model then optionally load checkpoint
         if self._model_path is None or self._model_path.endswith(".pt") or self._model_path.endswith(".pth"):
@@ -839,6 +861,11 @@ class ModelFactory:
         torch.cuda.set_device(local_rank)
         model = model.to("cpu")
 
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        mesh = None
+        if world_size > 1:
+            mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+
         mp_policy = None
         if self.fsdp_config.param_dtype is not None:
             mp_policy = MixedPrecisionPolicy(
@@ -849,6 +876,8 @@ class ModelFactory:
         fsdp_kwargs = {
             "reshard_after_forward": self.fsdp_config.reshard_after_forward,
         }
+        if mesh is not None:
+            fsdp_kwargs["mesh"] = mesh
         if mp_policy:
             fsdp_kwargs["mp_policy"] = mp_policy
         if self.fsdp_config.cpu_offload:
@@ -856,7 +885,7 @@ class ModelFactory:
                 pin_memory=self.fsdp_config.cpu_offload_pin_memory,
             )
 
-        for module in model.modules():
+        for module in reversed(list(model.modules())):
             if any(
                 isinstance(module, layer_cls)
                 for layer_cls in self.fsdp_config.transformer_layers

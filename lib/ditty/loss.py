@@ -83,7 +83,7 @@ def fused_linear_cross_entropy(
 
     backend = resolve_fused_ce_backend(backend)
     if backend == "liger":
-        loss, _, _ = LigerFusedLinearCrossEntropyFunction.apply(
+        liger_result = LigerFusedLinearCrossEntropyFunction.apply(
             hidden,
             weight,
             target,
@@ -94,6 +94,7 @@ def fused_linear_cross_entropy(
             0.0,  # label_smoothing
             "mean" if mask is None else "none",
         )
+        loss = liger_result[0] if isinstance(liger_result, tuple) else liger_result
         if mask is not None:
             divisor = hidden.shape[0] if include_padding_in_normalization else mask.sum().clamp(min=1)
             loss = (loss * mask).sum() / divisor
@@ -468,6 +469,7 @@ class FusedLinearCrossEntropyLoss(LossCalculator):
         weight_attr_path: Optional[str] = None,
         bias_attr_path: Optional[str] = None,
         include_padding_in_normalization: bool = False,
+        chunk_size: int = 4096,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -478,6 +480,7 @@ class FusedLinearCrossEntropyLoss(LossCalculator):
         self.weight_attr_path = weight_attr_path
         self.bias_attr_path = bias_attr_path
         self.include_padding_in_normalization = include_padding_in_normalization
+        self.chunk_size = int(chunk_size)
 
         self.backend = resolve_fused_ce_backend(backend)
 
@@ -534,9 +537,29 @@ class FusedLinearCrossEntropyLoss(LossCalculator):
             ignore_index=self.ignore_index,
             include_padding_in_normalization=self.include_padding_in_normalization,
             output_projection=output_projection,
+            chunk_size=self.chunk_size,
         )
 
-        return LossOutput(loss=loss, metrics={"ce": loss.item()})
+        ce_loss = loss
+        metrics = {"ce": ce_loss.item()}
+        aux_loss = getattr(model_output, "aux_loss", None)
+        if aux_loss is not None:
+            coef = 1.0
+            config = getattr(model, "config", None) if model is not None else None
+            if config is not None:
+                text_config = getattr(config, "text_config", None)
+                coef = float(
+                    getattr(config, "router_aux_loss_coef", None)
+                    or getattr(text_config, "router_aux_loss_coef", None)
+                    or coef
+                )
+            router_aux_loss = aux_loss.to(device=ce_loss.device, dtype=ce_loss.dtype)
+            loss = ce_loss + (coef * router_aux_loss)
+            metrics["router_aux_loss"] = float(router_aux_loss.detach().item())
+            metrics["router_aux_loss_coef"] = float(coef)
+            metrics["loss"] = loss.item()
+
+        return LossOutput(loss=loss, metrics=metrics)
 
     def _compute_liger(self, hidden, weight, bias, target, mask):
         return fused_linear_cross_entropy(

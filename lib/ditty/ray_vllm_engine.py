@@ -133,6 +133,7 @@ class RayVllmActor:
         worker_extension_cls: str = "ditty.vllm_worker_extension.StatelessWeightUpdateWorkerExtension",
         distributed_executor_backend: str = "ray",
         weight_transfer_backend: str | None = "nccl",
+        gdn_prefill_backend: str | None = None,
         cuda_visible_devices: str | None = None,
         unset_cuda_visible_devices: bool = True,
     ) -> None:
@@ -188,6 +189,8 @@ class RayVllmActor:
                 self._native_weight_transfer = False
         if max_model_len is not None:
             kwargs["max_model_len"] = int(max_model_len)
+        if gdn_prefill_backend:
+            kwargs["gdn_prefill_backend"] = str(gdn_prefill_backend)
         self.llm = LLM(**kwargs)
         self._is_asleep = False
 
@@ -222,18 +225,17 @@ class RayVllmActor:
 
     def update_weight(self, name: str, dtype_name: str, shape: Sequence[int]) -> None:
         if self._native_weight_transfer:
-            self.llm.collective_rpc(
-                "update_weights",
-                args=(
-                    {
-                        "names": [name],
-                        "dtype_names": [dtype_name],
-                        "shapes": [[int(dim) for dim in shape]],
-                        "is_checkpoint_format": True,
-                        "packed": False,
-                    },
-                ),
-            )
+            update_info = {
+                "names": [name],
+                "dtype_names": [dtype_name],
+                "shapes": [[int(dim) for dim in shape]],
+                "packed": False,
+            }
+            self.llm.start_weight_update(is_checkpoint_format=True)
+            try:
+                self.llm.update_weights({"update_info": update_info})
+            finally:
+                self.llm.finish_weight_update()
         else:
             self.llm.collective_rpc(
                 "update_weight",
@@ -247,18 +249,17 @@ class RayVllmActor:
         shapes: Sequence[Sequence[int]],
     ) -> None:
         if self._native_weight_transfer:
-            self.llm.collective_rpc(
-                "update_weights",
-                args=(
-                    {
-                        "names": [str(name) for name in names],
-                        "dtype_names": [str(dtype_name) for dtype_name in dtype_names],
-                        "shapes": [[int(dim) for dim in shape] for shape in shapes],
-                        "is_checkpoint_format": True,
-                        "packed": False,
-                    },
-                ),
-            )
+            update_info = {
+                "names": [str(name) for name in names],
+                "dtype_names": [str(dtype_name) for dtype_name in dtype_names],
+                "shapes": [[int(dim) for dim in shape] for shape in shapes],
+                "packed": False,
+            }
+            self.llm.start_weight_update(is_checkpoint_format=True)
+            try:
+                self.llm.update_weights({"update_info": update_info})
+            finally:
+                self.llm.finish_weight_update()
             return
         for name, dtype_name, shape in zip(names, dtype_names, shapes):
             self.update_weight(str(name), str(dtype_name), shape)
@@ -326,6 +327,7 @@ class RayVllmRolloutEngine:
         disable_custom_all_reduce: bool = False,
         distributed_executor_backend: str = "ray",
         weight_transfer_backend: str | None = "nccl",
+        gdn_prefill_backend: str | None = None,
         placement_group_ready_timeout_s: float | None = 300.0,
         ray_address: str | None = None,
         ray_runtime_env: dict[str, Any] | None = None,
@@ -336,9 +338,18 @@ class RayVllmRolloutEngine:
         max_sequences_per_request: int | None = None,
         max_expected_new_tokens_per_request: int | None = None,
         generate_timeout_s: float | None = None,
+        num_replicas: int | None = None,
     ) -> None:
         self.model_path = model_path
         self.tensor_parallel_size = int(tensor_parallel_size)
+        self.num_replicas = max(
+            1,
+            int(
+                num_replicas
+                if num_replicas is not None
+                else os.environ.get("DITTY_RAY_VLLM_NUM_REPLICAS", "1")
+            ),
+        )
         self.gpu_memory_utilization = float(gpu_memory_utilization)
         self.dtype = dtype
         self.max_model_len = max_model_len
@@ -348,6 +359,11 @@ class RayVllmRolloutEngine:
         self.disable_custom_all_reduce = bool(disable_custom_all_reduce)
         self.distributed_executor_backend = distributed_executor_backend
         self.weight_transfer_backend = weight_transfer_backend
+        self.gdn_prefill_backend = (
+            gdn_prefill_backend
+            if gdn_prefill_backend is not None
+            else os.environ.get("DITTY_RAY_VLLM_GDN_PREFILL_BACKEND")
+        )
         self.placement_group_ready_timeout_s = placement_group_ready_timeout_s
         self.ray_address = ray_address
         self.ray_runtime_env = dict(ray_runtime_env or {})
@@ -375,9 +391,12 @@ class RayVllmRolloutEngine:
             else os.environ.get("DITTY_RAY_VLLM_GENERATE_TIMEOUT_S", "540")
         )
         self.actor = None
+        self.actors: list[Any] = []
+        self.placement_groups: list[Any] = []
         self.placement_group = None
         self.ray = None
         self.model_update_group = None
+        self.model_update_groups: list[Any] = []
         self._initialized = False
         self._last_sync_step = -1
 
@@ -398,43 +417,52 @@ class RayVllmRolloutEngine:
                     init_kwargs["runtime_env"] = self.ray_runtime_env
                 ray.init(**init_kwargs)
 
+            placement_groups = []
             if self.distributed_executor_backend == "ray":
-                pg = placement_group(
-                    [{"GPU": 1, "CPU": 0} for _ in range(self.tensor_parallel_size)],
-                    strategy="PACK",
-                )
-                self.placement_group = pg
-            else:
-                pg = None
-            try:
-                scheduling = None
-                if pg is not None:
-                    ray.get(pg.ready(), timeout=self.placement_group_ready_timeout_s)
-                    scheduling = PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_capture_child_tasks=True,
-                        placement_group_bundle_index=0,
+                for replica_index in range(self.num_replicas):
+                    placement_groups.append(
+                        placement_group(
+                            [{"GPU": 1, "CPU": 0} for _ in range(self.tensor_parallel_size)],
+                            strategy="PACK",
+                        )
                     )
+                self.placement_groups = placement_groups
+                self.placement_group = placement_groups[0] if placement_groups else None
+            try:
+                for pg in placement_groups:
+                    ray.get(pg.ready(), timeout=self.placement_group_ready_timeout_s)
                 actor_cls = ray.remote(num_cpus=0, num_gpus=0)(RayVllmActor)
-                actor_options: dict[str, Any] = {}
-                if scheduling is not None:
-                    actor_options["scheduling_strategy"] = scheduling
-                self.actor = actor_cls.options(**actor_options).remote(
-                    model_path=self.model_path,
-                    tensor_parallel_size=self.tensor_parallel_size,
-                    gpu_memory_utilization=self.gpu_memory_utilization,
-                    dtype=self.dtype,
-                    max_model_len=self.max_model_len,
-                    trust_remote_code=self.trust_remote_code,
-                    enable_sleep_mode=self.enable_sleep_mode,
-                    enforce_eager=self.enforce_eager,
-                    disable_custom_all_reduce=self.disable_custom_all_reduce,
-                    worker_extension_cls=self.worker_extension_cls,
-                    distributed_executor_backend=self.distributed_executor_backend,
-                    weight_transfer_backend=self.weight_transfer_backend,
-                    cuda_visible_devices=self.cuda_visible_devices,
-                    unset_cuda_visible_devices=self.unset_cuda_visible_devices,
-                )
+                actors = []
+                for replica_index in range(self.num_replicas):
+                    actor_options: dict[str, Any] = {}
+                    if placement_groups:
+                        scheduling = PlacementGroupSchedulingStrategy(
+                            placement_group=placement_groups[replica_index],
+                            placement_group_capture_child_tasks=True,
+                            placement_group_bundle_index=0,
+                        )
+                        actor_options["scheduling_strategy"] = scheduling
+                    actors.append(
+                        actor_cls.options(**actor_options).remote(
+                            model_path=self.model_path,
+                            tensor_parallel_size=self.tensor_parallel_size,
+                            gpu_memory_utilization=self.gpu_memory_utilization,
+                            dtype=self.dtype,
+                            max_model_len=self.max_model_len,
+                            trust_remote_code=self.trust_remote_code,
+                            enable_sleep_mode=self.enable_sleep_mode,
+                            enforce_eager=self.enforce_eager,
+                            disable_custom_all_reduce=self.disable_custom_all_reduce,
+                            worker_extension_cls=self.worker_extension_cls,
+                            distributed_executor_backend=self.distributed_executor_backend,
+                            weight_transfer_backend=self.weight_transfer_backend,
+                            gdn_prefill_backend=self.gdn_prefill_backend,
+                            cuda_visible_devices=self.cuda_visible_devices,
+                            unset_cuda_visible_devices=self.unset_cuda_visible_devices,
+                        )
+                    )
+                self.actors = actors
+                self.actor = actors[0] if actors else None
                 self._init_weight_update_group()
             except BaseException:
                 self._cleanup_rank0()
@@ -446,26 +474,30 @@ class RayVllmRolloutEngine:
     def _cleanup_rank0(self) -> None:
         if not _is_rank0() or self.ray is None:
             return
-        if self.actor is not None:
+        actors = list(self.actors or ([] if self.actor is None else [self.actor]))
+        for actor in actors:
             timeout_s = _optional_positive_float(os.environ.get("DITTY_RAY_VLLM_SHUTDOWN_TIMEOUT_S", "20"))
             if timeout_s is not None:
                 try:
-                    self.ray.get(self.actor.shutdown.remote(timeout_s), timeout=timeout_s + 5.0)
+                    self.ray.get(actor.shutdown.remote(timeout_s), timeout=timeout_s + 5.0)
                 except BaseException:
                     pass
             try:
-                self.ray.kill(self.actor, no_restart=True)
+                self.ray.kill(actor, no_restart=True)
             except BaseException:
                 pass
-            self.actor = None
-        if self.placement_group is not None:
+        self.actors = []
+        self.actor = None
+        for pg in list(self.placement_groups or ([] if self.placement_group is None else [self.placement_group])):
             try:
                 from ray.util import remove_placement_group
 
-                remove_placement_group(self.placement_group)
+                remove_placement_group(pg)
             except BaseException:
                 pass
-            self.placement_group = None
+        self.placement_groups = []
+        self.placement_group = None
+        self.model_update_groups = []
         self.model_update_group = None
         self._initialized = False
 
@@ -511,34 +543,48 @@ class RayVllmRolloutEngine:
 
     def _init_weight_update_group(self) -> None:
         assert self.ray is not None
-        assert self.actor is not None
+        assert self.actors
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
         master_address = _default_host()
-        master_port = int(os.environ.get("DITTY_RAY_VLLM_WEIGHT_SYNC_PORT") or _find_free_port())
+        store_timeout_s = int(os.environ.get("DITTY_RAY_VLLM_WEIGHT_SYNC_STORE_TIMEOUT_S", "1800"))
         side_world_size = self.tensor_parallel_size + 1
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        groups = []
+        handles = []
+        configured_port = os.environ.get("DITTY_RAY_VLLM_WEIGHT_SYNC_PORT")
+        for replica_index, actor in enumerate(self.actors):
+            master_port = int(configured_port) + replica_index if configured_port else _find_free_port()
+            print(
+                f"[rank 0] ray_vllm weight sync group init "
+                f"replica={replica_index} host={master_address} port={master_port} "
+                f"world_size={side_world_size} store_timeout_s={store_timeout_s}",
+                flush=True,
+            )
+            handles.append(
+                actor.init_weight_update_group.remote(
+                    master_address,
+                    master_port,
+                    1,
+                    side_world_size,
+                )
+            )
+            pg = StatelessProcessGroup.create(
+                host=master_address,
+                port=master_port,
+                rank=0,
+                world_size=side_world_size,
+                store_timeout=store_timeout_s,
+            )
+            groups.append(PyNcclCommunicator(pg, device=device))
+        self.model_update_groups = groups
+        self.model_update_group = groups[0] if groups else None
+        self.ray.get(handles)
         print(
-            f"[rank 0] ray_vllm weight sync group init "
-            f"host={master_address} port={master_port} world_size={side_world_size}",
+            f"[rank 0] ray_vllm weight sync group ready replicas={len(groups)}",
             flush=True,
         )
-        handle = self.actor.init_weight_update_group.remote(
-            master_address,
-            master_port,
-            1,
-            side_world_size,
-        )
-        pg = StatelessProcessGroup.create(
-            host=master_address,
-            port=master_port,
-            rank=0,
-            world_size=side_world_size,
-        )
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
-        self.ray.get(handle)
-        print("[rank 0] ray_vllm weight sync group ready", flush=True)
 
     def update_weights_from_fsdp_model(self, model: torch.nn.Module) -> int:
         self.ensure_started()
@@ -551,7 +597,7 @@ class RayVllmRolloutEngine:
         update_handle = None
         if rank == 0:
             assert self.ray is not None
-            assert self.actor is not None
+            assert self.actors
             names = [name for name, _param in named_params]
             dtype_names = ["bfloat16" for _name, _param in named_params]
             shapes = [
@@ -559,10 +605,14 @@ class RayVllmRolloutEngine:
                 for _name, param in named_params
             ]
             print(
-                f"[rank 0] ray_vllm weight sync metadata start params={len(names)}",
+                f"[rank 0] ray_vllm weight sync metadata start "
+                f"replicas={len(self.actors)} params={len(names)}",
                 flush=True,
             )
-            update_handle = self.actor.update_weights.remote(names, dtype_names, shapes)
+            update_handle = [
+                actor.update_weights.remote(names, dtype_names, shapes)
+                for actor in self.actors
+            ]
         try:
             for name, param in named_params:
                 param_start = time.time()
@@ -586,8 +636,8 @@ class RayVllmRolloutEngine:
                     )
                 if rank == 0:
                     assert self.ray is not None
-                    assert self.actor is not None
-                    assert self.model_update_group is not None
+                    assert self.actors
+                    assert self.model_update_groups
                     tensor = full.detach().to(torch.bfloat16).contiguous()
                     if count < trace_first:
                         print(
@@ -595,7 +645,14 @@ class RayVllmRolloutEngine:
                             f"index={count + 1} name={name} shape={tuple(tensor.shape)}",
                             flush=True,
                         )
-                    self.model_update_group.broadcast(tensor, src=0, stream=torch.cuda.current_stream())
+                    for replica_index, group in enumerate(self.model_update_groups):
+                        group.broadcast(tensor, src=0, stream=torch.cuda.current_stream())
+                        if count < trace_first:
+                            print(
+                                f"[rank 0] ray_vllm weight sync broadcast replica done "
+                                f"replica={replica_index} index={count + 1} name={name}",
+                                flush=True,
+                            )
                     if count < trace_first:
                         print(
                             f"[rank 0] ray_vllm weight sync broadcast done "
@@ -617,7 +674,8 @@ class RayVllmRolloutEngine:
                 assert self.ray is not None
                 self.ray.get(update_handle)
                 print(
-                    f"[rank 0] ray_vllm weight sync actor load done params={count} "
+                    f"[rank 0] ray_vllm weight sync actor load done "
+                    f"replicas={len(self.actors)} params={count} "
                     f"elapsed={time.time() - start:.1f}s",
                     flush=True,
                 )
@@ -649,7 +707,7 @@ class RayVllmRolloutEngine:
             outputs_by_rank: list[Any] | None = None
             if rank == 0:
                 assert self.ray is not None
-                assert self.actor is not None
+                assert self.actors
                 try:
                     outputs_by_rank = [None for _ in range(world_size)]
                     combined_prompts: list[str] = []
@@ -697,6 +755,7 @@ class RayVllmRolloutEngine:
                                 flush=True,
                             )
                         combined_token_ids = [None for _ in combined_items]
+                        chunk_handles: list[tuple[int, int, Any]] = []
                         for chunk_index, (start, end) in enumerate(chunks):
                             if len(chunks) > 1:
                                 chunk_sequences = sum(
@@ -715,15 +774,19 @@ class RayVllmRolloutEngine:
                                     f"expected_new_tokens={chunk_tokens}",
                                     flush=True,
                                 )
-                            handle = self.actor.generate.remote(
+                            actor = self.actors[chunk_index % len(self.actors)]
+                            handle = actor.generate.remote(
                                 combined_prompts[start:end],
                                 combined_sampling_params[start:end],
                                 use_tqdm=use_tqdm_any,
                             )
-                            if self.generate_timeout_s is None:
-                                chunk_token_ids = self.ray.get(handle)
-                            else:
-                                chunk_token_ids = self.ray.get(handle, timeout=self.generate_timeout_s)
+                            chunk_handles.append((start, end, handle))
+                        handles = [handle for _start, _end, handle in chunk_handles]
+                        if self.generate_timeout_s is None:
+                            chunk_results = self.ray.get(handles)
+                        else:
+                            chunk_results = self.ray.get(handles, timeout=self.generate_timeout_s)
+                        for (start, end, _handle), chunk_token_ids in zip(chunk_handles, chunk_results):
                             if len(chunk_token_ids) != end - start:
                                 raise RuntimeError(
                                     "vLLM returned an unexpected number of chunk request outputs: "
@@ -758,9 +821,9 @@ class RayVllmRolloutEngine:
                 raise RuntimeError(str(token_ids_payload["__ditty_ray_vllm_error__"]))
         else:
             assert self.ray is not None
-            assert self.actor is not None
+            assert self.actors
             token_ids_payload = self.ray.get(
-                self.actor.generate.remote(list(prompts), sampling_params, use_tqdm=use_tqdm)
+                self.actors[0].generate.remote(list(prompts), sampling_params, use_tqdm=use_tqdm)
             )
         return [
             VllmRequestOutput(
@@ -770,14 +833,15 @@ class RayVllmRolloutEngine:
         ]
 
     def sleep(self, level: int = 1) -> None:
-        if _is_rank0() and self.actor is not None and self.ray is not None:
-            self.ray.get(self.actor.sleep.remote(int(level)))
+        if _is_rank0() and self.actors and self.ray is not None:
+            self.ray.get([actor.sleep.remote(int(level)) for actor in self.actors])
 
     def shutdown(self) -> None:
-        if _is_rank0() and self.actor is not None and self.ray is not None:
+        if _is_rank0() and self.actors and self.ray is not None:
             timeout_s = float(os.environ.get("DITTY_RAY_VLLM_SHUTDOWN_TIMEOUT_S", "20"))
-            try:
-                self.ray.get(self.actor.shutdown.remote(timeout_s), timeout=timeout_s + 5.0)
-            except BaseException:
-                pass
+            for actor in list(self.actors):
+                try:
+                    self.ray.get(actor.shutdown.remote(timeout_s), timeout=timeout_s + 5.0)
+                except BaseException:
+                    pass
         self._cleanup_rank0()
