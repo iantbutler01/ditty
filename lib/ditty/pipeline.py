@@ -1,16 +1,16 @@
 import logging
 import math
 import os
+import shutil
 import types
 from logging import getLogger
 from typing import Optional, List, Dict, Any, Union, Callable
-import bitsandbytes as bnb
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from datasets import Dataset, IterableDataset
 from .trainer import Trainer, TrainerState
@@ -26,6 +26,170 @@ from .checkpoint import CheckpointManager, Checkpoint
 logging.basicConfig(level=logging.INFO)
 
 logger = getLogger("ditty_pipeline")
+
+MUON_ADAMW_NAME_FRAGMENTS = (
+    "embed",
+    "embedding",
+    "lm_head",
+    "output",
+    "classifier",
+    "score",
+)
+
+
+_TORCHAO_OPTIM_VIEW_DTYPE_PATCHED = False
+
+
+def _register_torchao_optim_view_dtype_handlers() -> None:
+    """Teach TorchAO quantized optimizer states how to handle Dynamo's dtype view op."""
+    global _TORCHAO_OPTIM_VIEW_DTYPE_PATCHED
+    if _TORCHAO_OPTIM_VIEW_DTYPE_PATCHED:
+        return
+    try:
+        from torchao.optim.subclass_8bit import OptimState8bit
+        from torchao.optim.subclass_fp8 import OptimStateFp8
+    except (ImportError, AttributeError):
+        return
+
+    view_dtype = torch.ops.aten.view.dtype
+
+    @OptimState8bit.implements(view_dtype)
+    def _optim_state_8bit_view_dtype(func, types, args, kwargs):
+        tensor, dtype = args
+        return tensor.dequantize(output_dtype=dtype)
+
+    @OptimStateFp8.implements(view_dtype)
+    def _optim_state_fp8_view_dtype(func, types, args, kwargs):
+        tensor, dtype = args
+        return tensor.dequantize(output_dtype=dtype)
+
+    _TORCHAO_OPTIM_VIEW_DTYPE_PATCHED = True
+
+
+def _install_torchao_adam_eager_step(optimizer: torch.optim.Optimizer) -> torch.optim.Optimizer:
+    """Bypass TorchAO Adam's compiled per-parameter step for FSDP2 DTensor subclasses."""
+    from torch.distributed.tensor import DTensor
+    from torchao.optim.adam import _fp32_to_bf16_sr
+
+    def local_tensor(t: torch.Tensor) -> torch.Tensor:
+        return t.to_local() if isinstance(t, DTensor) else t
+
+    def state_to_fp32(t: torch.Tensor) -> torch.Tensor:
+        local = local_tensor(t)
+        dequantize = getattr(local, "dequantize", None)
+        if callable(dequantize) and hasattr(local, "codes") and hasattr(local, "scale"):
+            return dequantize(output_dtype=torch.float32)
+        return local.float()
+
+    def copy_state_(dst: torch.Tensor, src: torch.Tensor) -> None:
+        local_tensor(dst).copy_(src)
+
+    def adam_update_local_shard(
+        param: torch.Tensor,
+        grad: torch.Tensor,
+        step: torch.Tensor,
+        exp_avg: torch.Tensor,
+        exp_avg_sq: torch.Tensor,
+        max_exp_avg_sq: Optional[torch.Tensor],
+        lr: torch.Tensor,
+        beta1: float,
+        beta2: float,
+        weight_decay: float,
+        eps: float,
+        is_adamw: bool,
+        bf16_stochastic_round: bool,
+    ) -> None:
+        p_local = local_tensor(param.detach())
+        grad_f32 = local_tensor(grad).float()
+        p_f32 = p_local.float()
+        lr_value = float(lr.item())
+
+        if is_adamw:
+            p_f32.add_(p_f32, alpha=-(lr_value * weight_decay))
+        else:
+            grad_f32.add_(p_f32, alpha=weight_decay)
+
+        step_value = float(step.item())
+        bias_correction1 = 1 - beta1**step_value
+        bias_correction2 = 1 - beta2**step_value
+
+        exp_avg_f32 = state_to_fp32(exp_avg)
+        exp_avg_sq_f32 = state_to_fp32(exp_avg_sq)
+        exp_avg_f32.lerp_(grad_f32, 1 - beta1)
+        grad_f32.square_()
+        exp_avg_sq_f32.lerp_(grad_f32, 1 - beta2)
+        del grad_f32
+
+        copy_state_(exp_avg, exp_avg_f32)
+        copy_state_(exp_avg_sq, exp_avg_sq_f32)
+
+        if max_exp_avg_sq is not None:
+            max_exp_avg_sq_f32 = torch.maximum(state_to_fp32(max_exp_avg_sq), exp_avg_sq_f32)
+            copy_state_(max_exp_avg_sq, max_exp_avg_sq_f32)
+            denom = max_exp_avg_sq_f32.sqrt_()
+        else:
+            denom = exp_avg_sq_f32.sqrt_()
+
+        denom.div_(bias_correction2**0.5).add_(eps)
+        exp_avg_f32.div_(bias_correction1).div_(denom)
+        p_f32.add_(exp_avg_f32, alpha=-lr_value)
+
+        if bf16_stochastic_round:
+            p_local.copy_(_fp32_to_bf16_sr(p_f32))
+        else:
+            p_local.copy_(p_f32)
+
+    @torch.no_grad()
+    def eager_step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+
+                grad = param.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Sparse gradient is not supported")
+
+                state = self.state[param]
+                if len(state) == 0:
+                    state["step"] = torch.tensor(0.0)
+                    state["exp_avg"] = self._new_buffer(param, True)
+                    state["exp_avg_sq"] = self._new_buffer(param, False)
+                    if group["amsgrad"]:
+                        state["max_exp_avg_sq"] = self._new_buffer(param, False)
+
+                state["step"] += 1
+                if not isinstance(group["lr"], torch.Tensor):
+                    raise RuntimeError(
+                        "lr was changed to a non-Tensor object. If you want to update lr, "
+                        "please use optim.param_groups[0]['lr'].fill_(new_lr)"
+                    )
+
+                adam_update_local_shard(
+                    param,
+                    grad,
+                    state["step"],
+                    state["exp_avg"],
+                    state["exp_avg_sq"],
+                    state.get("max_exp_avg_sq", None),
+                    group["lr"],
+                    group["betas"][0],
+                    group["betas"][1],
+                    group["weight_decay"],
+                    group["eps"],
+                    self.is_adamw,
+                    self.bf16_stochastic_round and param.dtype is torch.bfloat16,
+                )
+
+        return loss
+
+    optimizer.step = types.MethodType(eager_step, optimizer)
+    return optimizer
 
 
 class Pipeline:
@@ -47,16 +211,26 @@ class Pipeline:
         checkpoint_every: int = 1000,
         load_checkpoint: bool = True,
         save_final_checkpoint: bool = True,
+        load_optimizer_checkpoint: bool = True,
         gradient_checkpointing: bool = True,
         use_8bit_optim: bool = False,
-        optim_backend: str = "torchao",  # "torch", "bnb", or "torchao"
+        optim_backend: str = "torchao",  # "torch", "bnb", "torchao", "adamw_fp8", "adafactor", or "muon"
         lr: float = 1e-4,
+        scale_lr_by_world_size: bool = True,
         weight_decay: float = 0.01,
+        muon_lr: Optional[float] = None,
+        muon_weight_decay: Optional[float] = None,
+        muon_momentum: float = 0.95,
+        muon_nesterov: bool = True,
+        muon_ns_steps: int = 5,
+        muon_adjust_lr_fn: Optional[str] = None,
         max_grad_norm: float = 1.0,
         epochs: int = 1,
         max_steps: Optional[int] = None,
         log_every: int = 10,
         metrics_logger: Optional[Any] = None,
+        validation_callbacks: Optional[List[Callable[..., Any]]] = None,
+        validation_every: int = 0,
         accelerator_kwargs: Dict[str, Any] = {},
         accelerator_mixed_precision: Optional[str] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
@@ -87,16 +261,26 @@ class Pipeline:
         self.checkpoint_every = checkpoint_every
         self.load_checkpoint = load_checkpoint
         self.save_final_checkpoint = save_final_checkpoint
+        self.load_optimizer_checkpoint = load_optimizer_checkpoint
         self.gradient_checkpointing = gradient_checkpointing
         self.use_8bit_optim = use_8bit_optim
         self.optim_backend = optim_backend
         self.lr = lr
+        self.scale_lr_by_world_size = scale_lr_by_world_size
         self.weight_decay = weight_decay
+        self.muon_lr = muon_lr
+        self.muon_weight_decay = muon_weight_decay
+        self.muon_momentum = muon_momentum
+        self.muon_nesterov = muon_nesterov
+        self.muon_ns_steps = muon_ns_steps
+        self.muon_adjust_lr_fn = muon_adjust_lr_fn
         self.max_grad_norm = max_grad_norm
         self.epochs = epochs
         self.max_steps = max_steps
         self.log_every = log_every
         self.metrics_logger = metrics_logger
+        self.validation_callbacks = validation_callbacks or []
+        self.validation_every = validation_every
         self.accelerator_kwargs = accelerator_kwargs
         self.accelerator_mixed_precision = accelerator_mixed_precision
         self._user_optimizer = optimizer
@@ -127,16 +311,59 @@ class Pipeline:
     def _prepare_dataloader(self):
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         rank = int(os.environ.get("RANK", 0))
+        is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
 
         if isinstance(self._dataset, DataLoader):
-            self._is_iterable_dataset = isinstance(getattr(self._dataset, "dataset", None), IterableDataset)
+            dataloader = self._dataset
+            dataset = getattr(dataloader, "dataset", None)
+            self._is_iterable_dataset = isinstance(dataset, IterableDataset)
+
+            if (
+                is_fsdp
+                and world_size > 1
+                and dataset is not None
+                and not self._is_iterable_dataset
+                and not isinstance(getattr(dataloader, "sampler", None), DistributedSampler)
+            ):
+                sampler_seed = self.seed if self.seed is not None else 42
+                drop_last = bool(getattr(getattr(dataloader, "batch_sampler", None), "drop_last", False))
+                sampler = DistributedSampler(
+                    dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=self.shuffle_each_epoch,
+                    seed=sampler_seed,
+                    drop_last=drop_last,
+                )
+                batch_size = dataloader.batch_size or self.batch_size
+                dataloader_kwargs = {
+                    "batch_size": batch_size,
+                    "sampler": sampler,
+                    "collate_fn": dataloader.collate_fn,
+                    "num_workers": dataloader.num_workers,
+                    "pin_memory": dataloader.pin_memory,
+                    "drop_last": drop_last,
+                    "worker_init_fn": dataloader.worker_init_fn,
+                    "persistent_workers": dataloader.persistent_workers,
+                }
+                if dataloader.num_workers > 0:
+                    dataloader_kwargs["prefetch_factor"] = dataloader.prefetch_factor
+                dataloader = DataLoader(dataset, **dataloader_kwargs)
+                if rank == 0:
+                    logger.info(
+                        "Using DistributedSampler for FSDP2 DataLoader input "
+                        "(%s ranks, batch_size=%s).",
+                        world_size,
+                        batch_size,
+                    )
+
             try:
-                dataset_size = len(self._dataset.dataset)
-                total_batches = (dataset_size // world_size + self.batch_size - 1) // self.batch_size * self.epochs
+                dataset_size = len(dataloader.dataset)
+                total_batches = len(dataloader) * self.epochs
             except TypeError:
                 dataset_size = None
                 total_batches = None
-            return self._dataset, dataset_size, total_batches
+            return dataloader, dataset_size, total_batches
 
         dataset = self._dataset
         original_dataset_size = len(dataset)
@@ -158,7 +385,12 @@ class Pipeline:
             if skip_samples < len(dataset):
                 if rank == 0:
                     logger.info(f"Fast skip: selecting samples {skip_samples:,} to {len(dataset):,} ({len(dataset) - skip_samples:,} remaining)")
-                dataset = dataset.select(range(skip_samples, len(dataset)))
+                if hasattr(dataset, "select"):
+                    dataset = dataset.select(range(skip_samples, len(dataset)))
+                elif isinstance(dataset, (list, tuple)):
+                    dataset = dataset[skip_samples:]
+                else:
+                    dataset = Subset(dataset, range(skip_samples, len(dataset)))
             else:
                 if rank == 0:
                     logger.info(f"Skip exceeds dataset size ({skip_samples:,} >= {len(dataset):,}), starting from beginning")
@@ -303,10 +535,117 @@ class Pipeline:
         self.dataloader, self.dataset_size, self.total_batches = self._prepare_dataloader()
         return None, None
 
+    def _delete_loaded_checkpoint_after_resume(self, checkpoint: Checkpoint | None) -> None:
+        value = os.environ.get("DITTY_DELETE_LOADED_CHECKPOINT_AFTER_RESUME", "")
+        if value.lower() not in {"1", "true", "yes", "on"}:
+            return
+        if checkpoint is None or not checkpoint.path:
+            return
+
+        rank = int(os.environ.get("RANK", 0))
+        if rank == 0:
+            shutil.rmtree(checkpoint.path, ignore_errors=True)
+            logger.info(
+                "Deleted loaded local resume checkpoint after restore: %s",
+                checkpoint.path,
+            )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+    @staticmethod
+    def _should_use_muon(name: str, param: nn.Parameter) -> bool:
+        if not param.requires_grad or param.ndim != 2:
+            return False
+        lowered = name.lower()
+        return not any(fragment in lowered for fragment in MUON_ADAMW_NAME_FRAGMENTS)
+
+    def _create_muon_optimizer(self, model: nn.Module, lr: float):
+        muon_cls = getattr(torch.optim, "Muon", None)
+        if muon_cls is None:
+            raise ImportError(
+                "optim_backend='muon' requires a PyTorch build that provides torch.optim.Muon. "
+                "Upgrade torch or pass a custom optimizer to Pipeline."
+            )
+
+        seen_param_ids = set()
+        muon_params = []
+        adamw_params = []
+        for name, param in model.named_parameters():
+            param_id = id(param)
+            if param_id in seen_param_ids or not param.requires_grad:
+                continue
+            seen_param_ids.add(param_id)
+            if self._should_use_muon(name, param):
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+
+        if isinstance(self.loss_calculator, nn.Module):
+            for param in self.loss_calculator.parameters():
+                param_id = id(param)
+                if param_id in seen_param_ids or not param.requires_grad:
+                    continue
+                seen_param_ids.add(param_id)
+                adamw_params.append(param)
+
+        if not muon_params:
+            raise ValueError(
+                "optim_backend='muon' selected, but no trainable 2D non-embedding "
+                "model parameters were found for torch.optim.Muon."
+            )
+
+        optimizers = []
+        if adamw_params:
+            optimizers.append(
+                torch.optim.AdamW(
+                    adamw_params,
+                    lr=lr,
+                    weight_decay=self.weight_decay,
+                    betas=(0.9, 0.999),
+                    eps=1e-8,
+                )
+            )
+
+        muon_lr = lr if self.muon_lr is None else self.muon_lr
+        muon_weight_decay = (
+            self.weight_decay if self.muon_weight_decay is None else self.muon_weight_decay
+        )
+        optimizers.append(
+            muon_cls(
+                muon_params,
+                lr=muon_lr,
+                weight_decay=muon_weight_decay,
+                momentum=self.muon_momentum,
+                nesterov=self.muon_nesterov,
+                ns_steps=self.muon_ns_steps,
+                adjust_lr_fn=self.muon_adjust_lr_fn,
+            )
+        )
+
+        logger.info(
+            "Created Muon optimizer split: %s tensor(s) with torch.optim.Muon, "
+            "%s tensor(s) with AdamW fallback.",
+            len(muon_params),
+            len(adamw_params),
+        )
+
+        if len(optimizers) == 1:
+            return optimizers[0]
+
+        from .optimizers import ChainedOptimizer
+
+        return ChainedOptimizer(optimizers)
+
     def _create_optimizer(self, model: nn.Module, checkpoint: Optional[Checkpoint] = None):
         """Create optimizer and optionally load state from checkpoint."""
         world_size = int(os.environ.get("WORLD_SIZE", 1))
-        lr = self.lr * world_size if world_size > 1 else self.lr
+        lr = self.lr * world_size if self.scale_lr_by_world_size and world_size > 1 else self.lr
+        if world_size > 1 and not self.scale_lr_by_world_size:
+            logger.info(
+                "Using unscaled optimizer lr=%s with world_size=%s",
+                self.lr,
+                world_size,
+            )
         is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
 
         # Collect parameters from model and loss calculator (if it's an nn.Module)
@@ -316,7 +655,29 @@ class Pipeline:
 
         if self._user_optimizer is not None:
             optimizer = self._user_optimizer
+        elif self.optim_backend == "adafactor":
+            optimizer = torch.optim.Adafactor(
+                params,
+                lr=lr,
+                weight_decay=self.weight_decay,
+                foreach=False,
+            )
+        elif self.optim_backend == "muon":
+            optimizer = self._create_muon_optimizer(model, lr)
+        elif self.optim_backend == "adamw_fp8":
+            _register_torchao_optim_view_dtype_handlers()
+            from torchao.optim import AdamWFp8
+
+            optimizer = AdamWFp8(
+                params,
+                lr=lr,
+                weight_decay=self.weight_decay,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+            )
+            optimizer = _install_torchao_adam_eager_step(optimizer)
         elif self.use_8bit_optim:
+            _register_torchao_optim_view_dtype_handlers()
             if self.optim_backend == "bnb":
                 if is_fsdp:
                     logger.warning("bitsandbytes 8-bit optimizer not compatible with FSDP2, falling back to torchao")
@@ -328,7 +689,10 @@ class Pipeline:
                         betas=(0.9, 0.999),
                         eps=1e-8,
                     )
+                    optimizer = _install_torchao_adam_eager_step(optimizer)
                 else:
+                    import bitsandbytes as bnb
+
                     optimizer = bnb.optim.Adam8bit(
                         params,
                         lr=lr,
@@ -345,6 +709,7 @@ class Pipeline:
                     betas=(0.9, 0.999),
                     eps=1e-8,
                 )
+                optimizer = _install_torchao_adam_eager_step(optimizer)
             else:
                 raise ValueError(f"Unknown optim_backend: {self.optim_backend}")
         else:
@@ -357,7 +722,7 @@ class Pipeline:
             )
 
         # Load optimizer state from checkpoint if available
-        if checkpoint is not None and checkpoint.optimizer_state is not None:
+        if self.load_optimizer_checkpoint and checkpoint is not None and checkpoint.optimizer_state is not None:
             try:
                 self.checkpoint_manager.apply_to_optimizer(checkpoint, optimizer)
             except Exception as e:
@@ -412,13 +777,16 @@ class Pipeline:
 
         if checkpoint is not None and checkpoint.distributed_checkpoint_path is not None:
             model_restore_ok = self.checkpoint_manager.apply_to_model(checkpoint, self.model)
-            if model_restore_ok:
+            if model_restore_ok and self.load_optimizer_checkpoint:
                 self.checkpoint_manager.apply_to_optimizer(checkpoint, self.optimizer, model=self.model)
             else:
-                checkpoint, trainer_state = self._discard_incompatible_checkpoint(
-                    "distributed model checkpoint schema no longer matches the current model"
-                )
-                self.optimizer = self._create_optimizer(self.model, None)
+                if not model_restore_ok:
+                    checkpoint, trainer_state = self._discard_incompatible_checkpoint(
+                        "distributed model checkpoint schema no longer matches the current model"
+                    )
+                    self.optimizer = self._create_optimizer(self.model, None)
+                elif rank == 0:
+                    logger.info("Skipping optimizer state restore; continuing with a freshly initialized optimizer.")
 
         # Step 4: Load RNG states if resuming
         if checkpoint is not None:
@@ -426,14 +794,17 @@ class Pipeline:
             # Load loss calculator state if available
             if checkpoint.loss_state is not None:
                 self.checkpoint_manager.apply_to_loss_calculator(checkpoint, self.loss_calculator)
+            if checkpoint.preprocessor_states is not None:
+                self.checkpoint_manager.apply_to_preprocessors(checkpoint, self.preprocessors)
             # Load loss optimizer state if available
-            if checkpoint.loss_optimizer_state is not None:
+            if self.load_optimizer_checkpoint and checkpoint.loss_optimizer_state is not None:
                 self.checkpoint_manager.apply_loss_optimizer_state(
                     checkpoint, self.optimizer, self.loss_calculator,
                     is_fsdp=getattr(self.loss_calculator, '_fsdp', False)
                 )
             if rank == 0:
                 logger.info(f"Resuming from epoch {trainer_state.epoch}, step {trainer_state.steps}, total_steps {trainer_state.total_steps}")
+            self._delete_loaded_checkpoint_after_resume(checkpoint)
 
         # Step 5: Create accelerator
         mixed_precision = self.accelerator_mixed_precision
@@ -464,7 +835,10 @@ class Pipeline:
         acc_kwargs.update(self.accelerator_kwargs)
         self.accelerator = Accelerator(**acc_kwargs)
 
-        if self.accelerator.is_main_process:
+        is_fsdp = self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False
+        is_main_process = rank == 0 if is_fsdp else self.accelerator.is_main_process
+
+        if is_main_process:
             logger.info(f"Mixed precision: {self.accelerator.mixed_precision}")
             logger.info(f"Model: {self.model.__class__.__name__}")
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -473,7 +847,7 @@ class Pipeline:
             logger.info(f"  Trainable params: {trainable_params:,}")
             logger.info(f"  Loss calculator: {self.loss_calculator.__class__.__name__}")
 
-        # Step 6: Create trainer (prepare() happens inside trainer)
+        # Step 6: Create trainer (prepare() happens inside trainer for non-FSDP paths)
         trainer = Trainer(
             model=self.model,
             optimizer=self.optimizer,
@@ -493,35 +867,43 @@ class Pipeline:
             use_scheduler=False,
             metrics_logger=self.metrics_logger,
             log_every=self.log_every,
+            validation_callbacks=self.validation_callbacks,
+            validation_every=self.validation_every,
             max_grad_norm=self.max_grad_norm,
             hf_hub_token=self.hf_hub_token,
             shuffle_each_epoch=self.shuffle_each_epoch,
             total_batches=self.total_batches,
-            is_fsdp=self.model_factory.fsdp_config.enabled if self.model_factory.fsdp_config else False,
+            is_fsdp=is_fsdp,
             initial_state=trainer_state,
+            initial_checkpoint_num=checkpoint.checkpoint_num if checkpoint is not None else None,
         )
 
         try:
             trainer.train(epochs=self.epochs, max_steps=self.max_steps)
 
-            self.accelerator.wait_for_everyone()
+            if is_fsdp:
+                if torch.distributed.is_available() and torch.distributed.is_initialized() and world_size > 1:
+                    torch.distributed.barrier()
+            else:
+                self.accelerator.wait_for_everyone()
 
             if self.push_to_hub_flag:
-                model = self.accelerator.unwrap_model(self.model)
+                model = self.model if is_fsdp else self.accelerator.unwrap_model(self.model)
 
                 if self.merge_adapters and hasattr(model, "merge_and_unload"):
                     logger.info("Merging adapters and unloading.")
                     model = model.merge_and_unload(True)
 
-                if self.accelerator.is_main_process:
+                if is_main_process:
                     logger.info("Pushing to hub!")
 
                 model.push_to_hub = types.MethodType(push_to_hub, model)
                 model.push_to_hub(self.output_hub_repo, token=self.hf_hub_token, accelerator=self.accelerator, private=self.private_repo)
 
-            if self.accelerator.is_main_process:
+            if rank == 0:
                 logger.info("Training complete!")
 
             return self.model
         finally:
-            self.accelerator.end_training()
+            if not is_fsdp:
+                self.accelerator.end_training()

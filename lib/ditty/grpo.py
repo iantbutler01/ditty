@@ -16,10 +16,14 @@ from .projection import (
 @dataclass(frozen=True)
 class GRPOConfig:
     clip_epsilon: float = 0.2
+    clip_epsilon_low: float | None = None
+    clip_epsilon_high: float | None = None
     kl_beta: float = 0.04
     epsilon: float = 1e-8
     normalize_advantages: bool = True
     center_advantages: bool = True
+    loss_type: str = "grpo"
+    max_completion_length: int | None = None
     kl_estimator: str = "low_variance"
     logprob_source: str = "logits"
     logprob_backend: str = "selective"
@@ -47,15 +51,31 @@ class RolloutGroup:
 
 
 def model_supports_selective_logits(model: Any) -> bool:
-    real_model = getattr(model, "_orig_mod", model)
-    forward = getattr(real_model, "forward", None)
-    if forward is None:
-        return False
-    try:
-        signature = inspect.signature(forward)
-    except (TypeError, ValueError):
-        return False
-    return "logits_to_keep" in signature.parameters
+    visited: set[int] = set()
+    candidates = [model]
+    while candidates:
+        current = candidates.pop(0)
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        forward = getattr(current, "forward", None)
+        if forward is not None:
+            try:
+                signature = inspect.signature(forward)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None:
+                parameters = signature.parameters
+                if "logits_to_keep" in parameters:
+                    return True
+                if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+                    return True
+
+        for attr in ("_orig_mod", "module", "_fsdp_wrapped_module", "_checkpoint_wrapped_module"):
+            wrapped = getattr(current, attr, None)
+            if wrapped is not None and id(wrapped) not in visited:
+                candidates.append(wrapped)
+    return False
 
 
 def build_selective_logit_positions(
@@ -83,9 +103,17 @@ def prepare_grpo_forward_kwargs(
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
     mask: torch.Tensor,
+    logprob_source: str = "logits",
 ) -> tuple[dict[str, Any], torch.Tensor | None]:
     forward_kwargs: dict[str, Any] = {"attention_mask": attention_mask}
     if not model_supports_selective_logits(model):
+        if logprob_source == "hidden_states":
+            forward_kwargs["output_hidden_states"] = True
+        return forward_kwargs, None
+
+    if logprob_source == "hidden_states":
+        forward_kwargs["output_hidden_states"] = True
+        forward_kwargs["logits_to_keep"] = 1
         return forward_kwargs, None
 
     positions = build_selective_logit_positions(labels, mask)
@@ -195,10 +223,62 @@ def gather_completion_logprobs(
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, *, epsilon: float = 1e-8) -> torch.Tensor:
-    mask = mask.to(values.dtype)
-    numerator = (values * mask).sum()
-    denominator = mask.sum().clamp(min=epsilon)
+    mask_bool = mask.to(device=values.device).bool()
+    mask_float = mask_bool.to(values.dtype)
+    masked_values = values.masked_fill(~mask_bool, 0.0)
+    numerator = (masked_values * mask_float).sum()
+    denominator = mask_float.sum().clamp(min=1.0)
     return numerator / denominator
+
+
+def masked_policy_loss(
+    objective: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    loss_type: str,
+    max_completion_length: int | None,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mask_bool = mask.to(device=objective.device).bool()
+    mask_float = mask_bool.to(objective.dtype)
+    masked_objective = objective.masked_fill(~mask_bool, 0.0)
+    objective_sum = (masked_objective * mask_float).sum()
+    active_tokens = mask_float.sum()
+    normalized_loss_type = loss_type.lower()
+
+    if normalized_loss_type in {"grpo", "gspo"}:
+        per_sequence_tokens = mask_float.sum(dim=1).clamp(min=1.0)
+        per_sequence_objective = (masked_objective * mask_float).sum(dim=1) / per_sequence_tokens
+        active_sequences = mask_bool.any(dim=1)
+        denominator = active_sequences.sum().to(objective.dtype).clamp(min=1.0)
+        return -(per_sequence_objective * active_sequences.to(objective.dtype)).sum() / denominator, denominator
+
+    if normalized_loss_type in {"bnpo", "dapo"}:
+        denominator = active_tokens.clamp(min=1.0)
+        return -objective_sum / denominator, denominator
+
+    if normalized_loss_type in {"dr_grpo", "dr_gspo"}:
+        batch_size = objective.shape[0]
+        constant_length = max_completion_length if max_completion_length is not None else objective.shape[1]
+        denominator = torch.tensor(
+            max(batch_size * int(constant_length), 1),
+            device=objective.device,
+            dtype=objective.dtype,
+        ).clamp(min=epsilon)
+        return -objective_sum / denominator, denominator
+
+    raise ValueError(
+        "Unknown GRPO loss_type="
+        f"{loss_type!r}; expected one of 'grpo', 'gspo', 'bnpo', 'dapo', 'dr_grpo', or 'dr_gspo'."
+    )
+
+
+def clip_bounds(config: GRPOConfig) -> tuple[float, float]:
+    low = config.clip_epsilon if config.clip_epsilon_low is None else config.clip_epsilon_low
+    high = config.clip_epsilon if config.clip_epsilon_high is None else config.clip_epsilon_high
+    if low < 0 or high < 0:
+        raise ValueError("clip epsilons must be non-negative")
+    return 1.0 - low, 1.0 + high
 
 
 def approximate_kl_divergence(
@@ -302,17 +382,70 @@ def compute_grpo_loss(
         )
 
     log_ratio = token_logprobs - shifted_old_logprobs
-    ratio = torch.exp(log_ratio)
-    clipped_ratio = torch.clamp(
-        ratio,
-        min=1.0 - config.clip_epsilon,
-        max=1.0 + config.clip_epsilon,
-    )
+    valid_mask_float = valid_mask.to(log_ratio.dtype)
+    valid_log_ratio = log_ratio.masked_fill(~valid_mask, 0.0)
+    valid_token_count = valid_mask_float.sum().clamp(min=1.0)
+    nonfinite_token_logprobs = (~torch.isfinite(token_logprobs) & valid_mask).to(log_ratio.dtype)
+    nonfinite_old_logprobs = (~torch.isfinite(shifted_old_logprobs) & valid_mask).to(log_ratio.dtype)
+    nonfinite_log_ratio = (~torch.isfinite(log_ratio) & valid_mask).to(log_ratio.dtype)
+    clip_min, clip_max = clip_bounds(config)
+    normalized_loss_type = config.loss_type.lower()
 
-    unclipped_objective = ratio * shifted_advantages
-    clipped_objective = clipped_ratio * shifted_advantages
-    policy_objective = torch.minimum(unclipped_objective, clipped_objective)
-    policy_loss = -masked_mean(policy_objective, valid_mask, epsilon=config.epsilon)
+    if normalized_loss_type == "gspo":
+        # Vanilla GSPO (Eq. 5): one sequence ratio per rollout, gradient flows through s_i
+        # directly via the live token log-probs that compose it.
+        sequence_valid = valid_mask.any(dim=1)
+        token_counts = valid_mask_float.sum(dim=1).clamp(min=1.0)
+        sequence_log_ratio = valid_log_ratio.sum(dim=1) / token_counts
+        sequence_log_ratio = torch.where(
+            sequence_valid,
+            sequence_log_ratio,
+            torch.zeros_like(sequence_log_ratio),
+        )
+        sequence_ratio = torch.exp(sequence_log_ratio).unsqueeze(1)
+        clipped_sequence_ratio = torch.clamp(sequence_ratio, min=clip_min, max=clip_max)
+        unclipped_objective = sequence_ratio * shifted_advantages
+        clipped_objective = clipped_sequence_ratio * shifted_advantages
+        policy_objective = torch.minimum(unclipped_objective, clipped_objective)
+        ratio = sequence_ratio.expand_as(token_logprobs)
+        clipped_ratio = clipped_sequence_ratio.expand_as(token_logprobs)
+    elif normalized_loss_type == "dr_gspo":
+        # GSPO-token (Eq. 13-14) + DR.GRPO constant-token denominator. The sequence ratio
+        # is detached so gradient flows only through the live token log-probs, preserving
+        # per-token credit semantics when A_{i,t} varies (e.g. FICA per-span credit) while
+        # keeping GSPO's variance-bounded importance correction.
+        sequence_valid = valid_mask.any(dim=1)
+        token_counts = valid_mask_float.sum(dim=1).clamp(min=1.0)
+        sequence_log_ratio = valid_log_ratio.sum(dim=1) / token_counts
+        sequence_log_ratio = torch.where(
+            sequence_valid,
+            sequence_log_ratio,
+            torch.zeros_like(sequence_log_ratio),
+        )
+        sequence_ratio = torch.exp(sequence_log_ratio).unsqueeze(1)
+        sequence_ratio_detached = sequence_ratio.detach()
+        clipped_sequence_ratio = torch.clamp(sequence_ratio_detached, min=clip_min, max=clip_max)
+        # token_term equals 1 in forward; gradient flows through live token_logprobs.
+        token_term = torch.exp(token_logprobs - token_logprobs.detach())
+        unclipped_objective = sequence_ratio_detached * token_term * shifted_advantages
+        clipped_objective = clipped_sequence_ratio * token_term * shifted_advantages
+        policy_objective = torch.minimum(unclipped_objective, clipped_objective)
+        ratio = sequence_ratio_detached.expand_as(token_logprobs)
+        clipped_ratio = clipped_sequence_ratio.expand_as(token_logprobs)
+    else:
+        ratio = torch.exp(log_ratio)
+        clipped_ratio = torch.clamp(ratio, min=clip_min, max=clip_max)
+        unclipped_objective = ratio * shifted_advantages
+        clipped_objective = clipped_ratio * shifted_advantages
+        policy_objective = torch.minimum(unclipped_objective, clipped_objective)
+
+    policy_loss, policy_denominator = masked_policy_loss(
+        policy_objective,
+        valid_mask,
+        loss_type=config.loss_type,
+        max_completion_length=config.max_completion_length,
+        epsilon=config.epsilon,
+    )
 
     kl_loss = torch.tensor(0.0, device=device, dtype=prediction_tensor.dtype)
     if reference_logprobs is not None and config.kl_beta != 0.0:
@@ -332,6 +465,8 @@ def compute_grpo_loss(
         kl_loss = config.kl_beta * masked_mean(approx_kl, valid_mask, epsilon=config.epsilon)
 
     total_loss = policy_loss + kl_loss
+    if not total_loss.requires_grad and prediction_tensor.requires_grad:
+        total_loss = total_loss + prediction_tensor.sum() * 0.0
     clip_fraction = masked_mean(
         (ratio.ne(clipped_ratio)).to(prediction_tensor.dtype),
         valid_mask,
@@ -347,5 +482,37 @@ def compute_grpo_loss(
         ),
         "grpo_ratio_mean": float(masked_mean(ratio, valid_mask, epsilon=config.epsilon).item()),
         "grpo_clipfrac": float(clip_fraction.item()),
+        "grpo_policy_denominator": float(policy_denominator.item()),
+        "grpo_nonfinite_token_logprob_frac": float(
+            (nonfinite_token_logprobs.sum() / valid_token_count).item()
+        ),
+        "grpo_nonfinite_old_logprob_frac": float(
+            (nonfinite_old_logprobs.sum() / valid_token_count).item()
+        ),
+        "grpo_nonfinite_log_ratio_frac": float(
+            (nonfinite_log_ratio.sum() / valid_token_count).item()
+        ),
     }
+    if normalized_loss_type in {"gspo", "dr_gspo"}:
+        sequence_valid = valid_mask.any(dim=1)
+        sequence_mask = sequence_valid.unsqueeze(1).expand_as(ratio)
+        metrics["grpo_sequence_ratio_mean"] = float(
+            masked_mean(ratio, sequence_mask, epsilon=config.epsilon).item()
+        )
+        # Per-sequence |s_i - 1| max diagnoses runaway ratio drift before clipping bites.
+        if sequence_valid.any():
+            seq_dev = (sequence_ratio.squeeze(1).detach() - 1.0).abs()
+            seq_dev = seq_dev.masked_fill(~sequence_valid, 0.0)
+            metrics["grpo_sequence_ratio_max_abs_dev"] = float(seq_dev.max().item())
+        else:
+            metrics["grpo_sequence_ratio_max_abs_dev"] = 0.0
+    # Zero-advantage sample fraction is a proxy for zero-variance groups upstream.
+    sample_zero_adv = (
+        masked_mean(
+            shifted_advantages.abs().lt(config.epsilon).to(prediction_tensor.dtype),
+            valid_mask,
+            epsilon=config.epsilon,
+        )
+    )
+    metrics["grpo_zero_advantage_sample_frac"] = float(sample_zero_adv.item())
     return total_loss, metrics

@@ -1,6 +1,6 @@
 import os
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from logging import getLogger
 from typing import Optional, List, Type, Dict, Any, Union
@@ -8,10 +8,10 @@ from typing import Optional, List, Type, Dict, Any, Union
 import torch
 import torch.nn as nn
 import safetensors
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer, BitsAndBytesConfig
 from transformers.utils import hub, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
-from bitsandbytes.nn import Linear4bit, Params4bit
 from accelerate import init_empty_weights
 from fastcore.parallel import parallel
 from tqdm.auto import tqdm
@@ -26,6 +26,18 @@ class ModelTransform:
     """
     def transform(self, model: nn.Module) -> nn.Module:
         raise NotImplementedError
+
+
+class ChainedModelTransform(ModelTransform):
+    """Apply multiple model transforms in order."""
+
+    def __init__(self, *transforms: Optional[ModelTransform]):
+        self.transforms = [transform for transform in transforms if transform is not None]
+
+    def transform(self, model: nn.Module) -> nn.Module:
+        for transform in self.transforms:
+            model = transform.transform(model)
+        return model
 
 
 class CausalLMBackboneTransform(ModelTransform):
@@ -49,13 +61,18 @@ class CausalLMBackboneTransform(ModelTransform):
     @staticmethod
     def _resolve_decoder(model: nn.Module) -> nn.Module:
         if hasattr(model, "get_decoder"):
-            decoder = model.get_decoder()
-            if decoder is not None:
-                return decoder
+            try:
+                decoder = model.get_decoder()
+                if decoder is not None:
+                    return decoder
+            except (AttributeError, NotImplementedError):
+                pass
         real_model = getattr(model, "_orig_mod", model)
         base_model_prefix = getattr(real_model, "base_model_prefix", None)
         if base_model_prefix and hasattr(real_model, base_model_prefix):
             return getattr(real_model, base_model_prefix)
+        if hasattr(real_model, "base_model"):
+            return real_model.base_model
         if hasattr(real_model, "model"):
             return real_model.model
         raise RuntimeError(
@@ -64,12 +81,328 @@ class CausalLMBackboneTransform(ModelTransform):
 
 
 @dataclass
+class Float8TrainingTransform(ModelTransform):
+    """Convert eligible dense and packed MoE matmuls to TorchAO float8 before FSDP2."""
+
+    recipe_name: str = "tensorwise"
+    enable_fsdp_float8_all_gather: bool = True
+    pad_inner_dim: bool = True
+    force_recompute_fp8_weight_in_bwd: bool = True
+    skip_fqn_fragments: tuple[str, ...] = ()
+
+    def transform(self, model: nn.Module) -> nn.Module:
+        try:
+            from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+            from torchao.float8.float8_linear import (
+                GemmInputRole,
+                LinearMMConfig,
+                ScaledMMConfig,
+                WeightWithDynamicFloat8CastTensor,
+                matmul_with_hp_or_float8_args,
+            )
+            from torchao.float8.float8_training_tensor import Float8TrainingTensor
+        except ImportError as exc:
+            raise ModuleNotFoundError(
+                "Float8TrainingTransform requires torchao.float8. Install a torchao "
+                "build compatible with the active PyTorch/CUDA stack."
+            ) from exc
+
+        config = replace(
+            Float8LinearConfig.from_recipe_name(self.recipe_name),
+            enable_fsdp_float8_all_gather=self.enable_fsdp_float8_all_gather,
+            pad_inner_dim=self.pad_inner_dim,
+            force_recompute_fp8_weight_in_bwd=self.force_recompute_fp8_weight_in_bwd,
+        )
+        self._install_raw_float8_storage_support(
+            weight_wrapper_cls=WeightWithDynamicFloat8CastTensor,
+            float8_training_tensor_cls=Float8TrainingTensor,
+            gemm_input_role=GemmInputRole,
+        )
+
+        converted = 0
+        skipped_shape = 0
+        skipped_shape_examples: list[str] = []
+
+        def module_filter_fn(module: nn.Module, fqn: str) -> bool:
+            nonlocal converted, skipped_shape
+            if not isinstance(module, nn.Linear):
+                return True
+            if any(fragment and fragment in fqn for fragment in self.skip_fqn_fragments):
+                return False
+            in_features = int(getattr(module, "in_features", 0))
+            out_features = int(getattr(module, "out_features", 0))
+            shape_supported = out_features % 16 == 0
+            if not self.pad_inner_dim:
+                shape_supported = shape_supported and in_features % 16 == 0
+            if not shape_supported:
+                skipped_shape += 1
+                if len(skipped_shape_examples) < 8:
+                    skipped_shape_examples.append(f"{fqn}({in_features}->{out_features})")
+                return False
+            converted += 1
+            return True
+
+        logger.info(
+            "Applying TorchAO float8 training transform: recipe=%s "
+            "fsdp_float8_all_gather=%s pad_inner_dim=%s "
+            "force_recompute_fp8_weight_in_bwd=%s skip=%s",
+            self.recipe_name,
+            self.enable_fsdp_float8_all_gather,
+            self.pad_inner_dim,
+            self.force_recompute_fp8_weight_in_bwd,
+            ",".join(self.skip_fqn_fragments),
+        )
+        model = convert_to_float8_training(
+            model,
+            module_filter_fn=module_filter_fn,
+            config=config,
+        )
+        logger.info(
+            "Converted %s Linear module(s) to TorchAO Float8Linear; skipped %s shape-ineligible "
+            "Linear module(s)%s.",
+            converted,
+            skipped_shape,
+            f": {', '.join(skipped_shape_examples)}" if skipped_shape_examples else "",
+        )
+        wrapped_experts = self._wrap_packed_moe_experts(
+            model,
+            config=config,
+            linear_mm_config=LinearMMConfig(
+                ScaledMMConfig(config.emulate, config.gemm_config_output.use_fast_accum, False, config.pad_inner_dim),
+                ScaledMMConfig(config.emulate, config.gemm_config_grad_input.use_fast_accum, False, config.pad_inner_dim),
+                ScaledMMConfig(config.emulate, config.gemm_config_grad_weight.use_fast_accum, False, config.pad_inner_dim),
+            ),
+            weight_wrapper_cls=WeightWithDynamicFloat8CastTensor,
+            matmul_fn=matmul_with_hp_or_float8_args,
+        )
+        if wrapped_experts:
+            logger.info("Wrapped %s packed MoE expert module(s) for TorchAO float8 FSDP all-gather.", wrapped_experts)
+        patched_masks = _patch_float8_unsafe_causal_mask_builders(model)
+        if patched_masks:
+            logger.info("Patched %s FP8-unsafe causal-mask builder(s).", patched_masks)
+        model._ditty_float8_training_enabled = True
+        return model
+
+    @staticmethod
+    def _install_raw_float8_storage_support(
+        *,
+        weight_wrapper_cls: Any,
+        float8_training_tensor_cls: Any,
+        gemm_input_role: Any,
+    ) -> None:
+        if getattr(weight_wrapper_cls, "_ditty_raw_float8_storage_patch", False):
+            return
+
+        original_pre_all_gather = weight_wrapper_cls.fsdp_pre_all_gather
+        original_post_all_gather = weight_wrapper_cls.fsdp_post_all_gather
+        float8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+
+        def fsdp_pre_all_gather(self, mesh):
+            tensor = getattr(self, "_tensor", None)
+            if isinstance(tensor, torch.Tensor) and tensor.dtype in float8_dtypes:
+                scale = torch.ones((), device=tensor.device, dtype=torch.float32)
+                return (tensor,), (scale,)
+            return original_pre_all_gather(self, mesh)
+
+        def fsdp_post_all_gather(self, all_gather_outputs, metadata, param_dtype, *, out=None):
+            tensor = getattr(self, "_tensor", None)
+            if not (isinstance(tensor, torch.Tensor) and tensor.dtype in float8_dtypes):
+                return original_post_all_gather(self, all_gather_outputs, metadata, param_dtype, out=out)
+
+            (data,) = all_gather_outputs
+            (scale,) = metadata
+            if out is not None:
+                from torch.distributed._tensor import DTensor
+
+                if isinstance(out, float8_training_tensor_cls):
+                    out._data = data
+                    out._scale = scale
+                elif isinstance(out, DTensor) and isinstance(out._local_tensor, float8_training_tensor_cls):
+                    out._local_tensor._data = data
+                    out._local_tensor._scale = scale
+                else:
+                    raise RuntimeError(
+                        "raw-FP8 FSDP post-all-gather expected Float8TrainingTensor output, "
+                        f"got {type(out).__name__}"
+                    )
+                return
+
+            return float8_training_tensor_cls(
+                data,
+                scale,
+                param_dtype,
+                self._linear_mm_config,
+                gemm_input_role.WEIGHT,
+            ), (data,)
+
+        weight_wrapper_cls.fsdp_pre_all_gather = fsdp_pre_all_gather
+        weight_wrapper_cls.fsdp_post_all_gather = fsdp_post_all_gather
+        weight_wrapper_cls._ditty_raw_float8_storage_patch = True
+
+    @staticmethod
+    def _wrap_packed_moe_experts(
+        model: nn.Module,
+        *,
+        config: Any,
+        linear_mm_config: Any,
+        weight_wrapper_cls: Any,
+        matmul_fn: Any,
+    ) -> int:
+        wrapped = 0
+        for module in model.modules():
+            gate_up_proj = getattr(module, "gate_up_proj", None)
+            down_proj = getattr(module, "down_proj", None)
+            if not isinstance(gate_up_proj, nn.Parameter) or not isinstance(down_proj, nn.Parameter):
+                continue
+            if gate_up_proj.dim() != 3 or down_proj.dim() != 3:
+                continue
+            if getattr(module, "_ditty_float8_packed_moe_wrapped", False):
+                continue
+
+            module.gate_up_proj = nn.Parameter(
+                weight_wrapper_cls(
+                    gate_up_proj,
+                    linear_mm_config,
+                    config.cast_config_weight.target_dtype,
+                ),
+                requires_grad=gate_up_proj.requires_grad,
+            )
+            module.down_proj = nn.Parameter(
+                weight_wrapper_cls(
+                    down_proj,
+                    linear_mm_config,
+                    config.cast_config_weight.target_dtype,
+                ),
+                requires_grad=down_proj.requires_grad,
+            )
+            module._ditty_float8_expert_config = config
+            module._ditty_float8_expert_linear_mm_config = linear_mm_config
+            module._ditty_float8_expert_matmul = matmul_fn
+            module._ditty_float8_packed_moe_wrapped = True
+            module.forward = types.MethodType(_float8_packed_moe_experts_forward, module)
+            wrapped += 1
+        return wrapped
+
+
+def _float8_packed_moe_experts_forward(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    final_hidden_states = torch.zeros_like(hidden_states)
+    num_experts = int(getattr(self, "num_experts"))
+    with torch.no_grad():
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    matmul = self._ditty_float8_expert_matmul
+    mm_config = self._ditty_float8_expert_linear_mm_config
+    config = self._ditty_float8_expert_config
+
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        expert_i = int(expert_idx.item())
+        if expert_i == num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        gate_up_weight = self.gate_up_proj[expert_i : expert_i + 1].reshape(
+            self.gate_up_proj.shape[1],
+            self.gate_up_proj.shape[2],
+        )
+        gate_up = matmul.apply(current_state, gate_up_weight.t(), mm_config, config)
+        gate, up = gate_up.chunk(2, dim=-1)
+        current_hidden_states = self.act_fn(gate) * up
+        down_weight = self.down_proj[expert_i : expert_i + 1].reshape(
+            self.down_proj.shape[1],
+            self.down_proj.shape[2],
+        )
+        current_hidden_states = matmul.apply(current_hidden_states, down_weight.t(), mm_config, config)
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+    return final_hidden_states
+
+
+def _shape_only_tensor_like(tensor: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    """Return a tiny-storage tensor with the same shape/device for shape-only model helpers."""
+
+    shape = tuple(tensor.shape)
+    if not shape:
+        return torch.empty((), device=tensor.device, dtype=dtype)
+    base = torch.empty((), device=tensor.device, dtype=dtype)
+    return torch.as_strided(base, shape, tuple(0 for _ in shape))
+
+
+def _patch_float8_unsafe_causal_mask_builders(
+    model: nn.Module,
+    *,
+    mask_dtype: torch.dtype = torch.float32,
+) -> int:
+    """Keep model-specific causal-mask construction off FP8 control tensors."""
+
+    float8_dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+    patched = 0
+    for module in model.modules():
+        if getattr(module, "_ditty_float8_causal_mask_patch", False):
+            continue
+        update_causal_mask = getattr(module, "_update_causal_mask", None)
+        if not callable(update_causal_mask):
+            continue
+        module_type = f"{module.__class__.__module__}.{module.__class__.__name__}".lower()
+        if "nemotron" not in module_type:
+            continue
+
+        def wrapped_update_causal_mask(
+            self,
+            attention_mask,
+            input_tensor,
+            cache_position,
+            *,
+            _original=update_causal_mask,
+        ):
+            if isinstance(input_tensor, torch.Tensor) and input_tensor.dtype in float8_dtypes:
+                input_tensor = _shape_only_tensor_like(input_tensor, dtype=mask_dtype)
+            return _original(attention_mask, input_tensor, cache_position)
+
+        module._ditty_original_update_causal_mask = update_causal_mask
+        module._update_causal_mask = types.MethodType(wrapped_update_causal_mask, module)
+        module._ditty_float8_causal_mask_patch = True
+        patched += 1
+    return patched
+
+
+def _enable_router_logits_for_moe(model: nn.Module) -> None:
+    """Enable HF MoE router logits so losses can include the router aux term."""
+
+    seen: set[int] = set()
+    for owner in (
+        model,
+        getattr(model, "model", None),
+        getattr(model, "language_model", None),
+        getattr(getattr(model, "model", None), "language_model", None),
+    ):
+        config = getattr(owner, "config", None) if owner is not None else None
+        for cfg in (config, getattr(config, "text_config", None) if config is not None else None):
+            if cfg is None or id(cfg) in seen:
+                continue
+            seen.add(id(cfg))
+            if hasattr(cfg, "output_router_logits") or hasattr(cfg, "router_aux_loss_coef"):
+                cfg.output_router_logits = True
+
+
+@dataclass
 class FSDPConfig:
     enabled: bool = False
     transformer_layers: List[Type[nn.Module]] = field(default_factory=list)
     param_dtype: Optional[torch.dtype] = None  # e.g. torch.bfloat16
     reduce_dtype: Optional[torch.dtype] = None  # None = match param_dtype, torch.float32 for accuracy
+    original_param_dtype: Optional[torch.dtype] = None  # dtype for sharded optimizer params after fully_shard
     reshard_after_forward: bool = True  # True = FULL_SHARD, False = SHARD_GRAD_OP
+    cpu_offload: bool = False
+    cpu_offload_pin_memory: bool = True
 
 
 @dataclass
@@ -335,6 +668,8 @@ class ModelFactory:
         )
 
     def _replace_linear(self, model: nn.Module, skip_modules: List[str] = None):
+        from bitsandbytes.nn import Linear4bit
+
         skip_modules = skip_modules or ["lm_head"]
         for name, module in model.named_children():
             if name in skip_modules:
@@ -360,6 +695,8 @@ class ModelFactory:
 
     def _load_and_quantize(self, module: nn.Module, name: str, value: torch.Tensor,
                            device=None, dtype=None, skip_names=None, to_cpu=False, to_meta=False):
+        from bitsandbytes.nn import Params4bit
+
         skip_names = skip_names or []
 
         def place_on_device(value):
@@ -483,11 +820,13 @@ class ModelFactory:
                 elif self.quant_config.bits == 8:
                     bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
-            return self._model_class.from_pretrained(
+            model = self._model_class.from_pretrained(
                 self._model_path,
                 quantization_config=bnb_config,
                 **self._load_kwargs,
             )
+            _enable_router_logits_for_moe(model)
+            return model
 
         # For custom model classes, create model then optionally load checkpoint
         if self._model_path is None or self._model_path.endswith(".pt") or self._model_path.endswith(".pth"):
@@ -522,6 +861,11 @@ class ModelFactory:
         torch.cuda.set_device(local_rank)
         model = model.to("cpu")
 
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        mesh = None
+        if world_size > 1:
+            mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+
         mp_policy = None
         if self.fsdp_config.param_dtype is not None:
             mp_policy = MixedPrecisionPolicy(
@@ -532,10 +876,16 @@ class ModelFactory:
         fsdp_kwargs = {
             "reshard_after_forward": self.fsdp_config.reshard_after_forward,
         }
+        if mesh is not None:
+            fsdp_kwargs["mesh"] = mesh
         if mp_policy:
             fsdp_kwargs["mp_policy"] = mp_policy
+        if self.fsdp_config.cpu_offload:
+            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(
+                pin_memory=self.fsdp_config.cpu_offload_pin_memory,
+            )
 
-        for module in model.modules():
+        for module in reversed(list(model.modules())):
             if any(
                 isinstance(module, layer_cls)
                 for layer_cls in self.fsdp_config.transformer_layers
@@ -543,9 +893,17 @@ class ModelFactory:
                 fully_shard(module, **fsdp_kwargs)
 
         fully_shard(model, **fsdp_kwargs)
+        if self.fsdp_config.original_param_dtype is not None:
+            logger.info(
+                "Casting FSDP2 sharded original parameters to %s",
+                self.fsdp_config.original_param_dtype,
+            )
+            model.to(self.fsdp_config.original_param_dtype)
         return model
 
     def _setup_quantized_meta_for_peft(self, model: nn.Module):
+        from bitsandbytes.nn import Params4bit
+
         def temp_to_method(self, *args, **kwargs):
             return self
         for param in model.parameters():
@@ -554,6 +912,8 @@ class ModelFactory:
                 param.quant_state.to = types.MethodType(temp_to_method, param.quant_state)
 
     def _setup_quantized_peft_meta_for_training(self, model: nn.Module):
+        from bitsandbytes.nn import Params4bit
+
         for param in model.parameters():
             if isinstance(param, Params4bit) and hasattr(param.quant_state, "_orig_to"):
                 param.quant_state.to = param.quant_state._orig_to

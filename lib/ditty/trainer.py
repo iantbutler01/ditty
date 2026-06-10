@@ -7,7 +7,6 @@ from .checkpoint import CheckpointManager
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from accelerate import Accelerator
 from accelerate.utils import send_to_device, set_seed
 from transformers.trainer_pt_utils import get_model_param_count
@@ -69,6 +68,159 @@ def _format_progress_state(
     return current_epoch_decimal, batch_info, progress_info
 
 
+def _distributed_mean_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return metrics
+
+    world_size = torch.distributed.get_world_size()
+    if world_size <= 1:
+        return metrics
+
+    local_metrics = {
+        str(key): float(value)
+        for key, value in metrics.items()
+        if isinstance(value, (int, float))
+    }
+    gathered: list[dict[str, float] | None] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, local_metrics)
+
+    keys = sorted({key for row in gathered if isinstance(row, dict) for key in row})
+    averaged: dict[str, float] = {}
+    for key in keys:
+        averaged[key] = sum(
+            float(row.get(key, 0.0)) if isinstance(row, dict) else 0.0
+            for row in gathered
+        ) / world_size
+    averaged["distributed_metric_world_size"] = float(world_size)
+    return averaged
+
+
+def _mean_numeric_metric_dicts(metric_rows: list[dict[str, Any]]) -> dict[str, float]:
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for metrics in metric_rows:
+        for key, value in metrics.items():
+            if not isinstance(value, (int, float)):
+                continue
+            name = str(key)
+            sums[name] = sums.get(name, 0.0) + float(value)
+            counts[name] = counts.get(name, 0) + 1
+    return {key: sums[key] / counts[key] for key in sorted(sums) if counts.get(key, 0) > 0}
+
+
+def _precompute_float8_fsdp_scales_if_available(model: nn.Module) -> None:
+    try:
+        from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+    except (ImportError, AttributeError):
+        return
+    precompute_float8_dynamic_scale_for_fsdp(model)
+
+
+def _numel_if_tensor(value: Any) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.numel())
+    return 0.0
+
+
+def _sum_if_tensor(value: Any) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().sum().item())
+    return 0.0
+
+
+def _batch_rows(value: Any) -> float:
+    if isinstance(value, torch.Tensor) and value.dim() > 0:
+        return float(value.shape[0])
+    if isinstance(value, dict):
+        for item in value.values():
+            rows = _batch_rows(item)
+            if rows > 0:
+                return rows
+    if isinstance(value, (list, tuple)) and value:
+        return float(len(value))
+    return 0.0
+
+
+def _training_perf_metrics(
+    *,
+    batch: Any,
+    ctx: Context,
+    elapsed_seconds: float,
+    device: torch.device,
+) -> dict[str, float]:
+    rows = _batch_rows(batch)
+    input_ids = ctx.get("input_ids", batch)
+    padded_tokens = _numel_if_tensor(input_ids)
+    forward_kwargs = ctx.get("forward_kwargs", {})
+    attention_mask = (
+        forward_kwargs.get("attention_mask")
+        if isinstance(forward_kwargs, dict)
+        else None
+    )
+    input_tokens = _sum_if_tensor(attention_mask) or padded_tokens
+    target_tokens = _sum_if_tensor(ctx.get("mask"))
+
+    counts = torch.tensor(
+        [rows, padded_tokens, input_tokens, target_tokens],
+        device=device,
+        dtype=torch.float64,
+    )
+    elapsed = torch.tensor(
+        [max(float(elapsed_seconds), 0.0)],
+        device=device,
+        dtype=torch.float64,
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(elapsed, op=torch.distributed.ReduceOp.MAX)
+
+    step_seconds = max(float(elapsed.item()), 1e-12)
+    global_rows, global_padded_tokens, global_input_tokens, global_target_tokens = (
+        float(counts[0].item()),
+        float(counts[1].item()),
+        float(counts[2].item()),
+        float(counts[3].item()),
+    )
+    return {
+        "perf_step_seconds": step_seconds,
+        "perf_global_rows": global_rows,
+        "perf_global_padded_tokens": global_padded_tokens,
+        "perf_global_input_tokens": global_input_tokens,
+        "perf_global_target_tokens": global_target_tokens,
+        "perf_rows_per_second": global_rows / step_seconds,
+        "perf_padded_tokens_per_second": global_padded_tokens / step_seconds,
+        "perf_input_tokens_per_second": global_input_tokens / step_seconds,
+        "perf_target_tokens_per_second": global_target_tokens / step_seconds,
+    }
+
+
+def _slice_batch_tensor(value: Any, start: int, end: int, batch_size: int) -> Any:
+    if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch_size:
+        return value[start:end]
+    return value
+
+
+def _slice_batch_mapping(mapping: dict[str, Any], start: int, end: int, batch_size: int) -> dict[str, Any]:
+    return {
+        key: _slice_batch_tensor(value, start, end, batch_size)
+        for key, value in mapping.items()
+    }
+
+
+def _next_checkpoint_iteration(
+    *,
+    local_latest_checkpoint_num: Optional[int],
+    initial_checkpoint_num: Optional[int],
+    has_initial_state: bool,
+) -> int:
+    checkpoint_iteration = int(local_latest_checkpoint_num or 0)
+    if initial_checkpoint_num is not None:
+        checkpoint_iteration = max(checkpoint_iteration, int(initial_checkpoint_num))
+    if has_initial_state:
+        checkpoint_iteration += 1
+    return checkpoint_iteration
+
+
 @dataclass(kw_only=True)
 class TrainerState:
     epoch: int = 0
@@ -121,6 +273,8 @@ class Trainer:
     seed: Optional[int] = None
     metrics_logger: Optional[Any] = None
     log_every: int = 10
+    validation_callbacks: List[Callable[..., Any]] = field(default_factory=list)
+    validation_every: int = 0
     max_grad_norm: Optional[float] = None
     shuffle_each_epoch: bool = True
     total_batches: Optional[int] = None
@@ -128,6 +282,7 @@ class Trainer:
 
     # Pre-loaded state (from CheckpointManager, loaded before Trainer creation)
     initial_state: Optional[TrainerState] = None
+    initial_checkpoint_num: Optional[int] = None
 
     def __post_init__(self):
         if self.seed:
@@ -148,30 +303,18 @@ class Trainer:
         elif self.fp16:
             self.f16_dtype = torch.float16
 
-        self.device = self.accelerator.device
+        if self.is_fsdp:
+            if torch.cuda.is_available():
+                local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                self.device = torch.device(f"cuda:{local_rank}")
+            else:
+                self.device = torch.device("cpu")
+        else:
+            self.device = self.accelerator.device
         self._manual_device_placement = False
 
         if self.is_fsdp:
-            dataloader_is_pre_sharded = (
-                hasattr(self.dataset, "sampler") and isinstance(self.dataset.sampler, DistributedSampler)
-            )
-            if self.use_scheduler:
-                if dataloader_is_pre_sharded:
-                    self.optimizer, self.scheduler = self.accelerator.prepare(
-                        self.optimizer, self.scheduler
-                    )
-                else:
-                    self.optimizer, self.dataset, self.scheduler = self.accelerator.prepare(
-                        self.optimizer, self.dataset, self.scheduler
-                    )
-            else:
-                if dataloader_is_pre_sharded:
-                    self.optimizer = self.accelerator.prepare(self.optimizer)
-                else:
-                    self.optimizer, self.dataset = self.accelerator.prepare(
-                        self.optimizer, self.dataset
-                    )
-            self._manual_device_placement = dataloader_is_pre_sharded
+            self._manual_device_placement = True
         else:
             if self.use_scheduler:
                 (
@@ -196,21 +339,108 @@ class Trainer:
 
         # Initialize checkpoint manager
         self.checkpoint_manager = CheckpointManager(self.output_dir)
-        self._checkpoint_iteration = self.checkpoint_manager.get_latest_checkpoint_num() or 0
-        if self.initial_state is not None:
-            self._checkpoint_iteration += 1
+        self._checkpoint_iteration = _next_checkpoint_iteration(
+            local_latest_checkpoint_num=self.checkpoint_manager.get_latest_checkpoint_num(),
+            initial_checkpoint_num=self.initial_checkpoint_num,
+            has_initial_state=self.initial_state is not None,
+        )
+        self._last_checkpoint_total_steps: int | None = None
+
+    def _distributed_initialized(self) -> bool:
+        return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+    def _rank(self) -> int:
+        if self._distributed_initialized():
+            return torch.distributed.get_rank()
+        return int(os.environ.get("RANK", 0))
+
+    def _world_size(self) -> int:
+        if self._distributed_initialized():
+            return torch.distributed.get_world_size()
+        return int(os.environ.get("WORLD_SIZE", 1))
+
+    def _is_main_process(self) -> bool:
+        if self.is_fsdp:
+            return self._rank() == 0
+        return self.accelerator.is_main_process
+
+    def _num_processes(self) -> int:
+        if self.is_fsdp:
+            return self._world_size()
+        return self.accelerator.num_processes
+
+    def _wait_for_everyone(self) -> None:
+        if self.is_fsdp:
+            if self._distributed_initialized() and self._world_size() > 1:
+                torch.distributed.barrier()
+            return
+        self.accelerator.wait_for_everyone()
+
+    def _unwrap_model_for_save(self) -> nn.Module:
+        if self.is_fsdp:
+            return self.model
+        return self.accelerator.unwrap_model(self.model)
+
+    def _scaler_for_save(self) -> Optional[torch.amp.GradScaler]:
+        if self.is_fsdp:
+            return None
+        return (
+            self.accelerator.scaler
+            if hasattr(self.accelerator, "scaler") and self.accelerator.scaler
+            else None
+        )
+
+    def _accumulate_context(self):
+        if self.is_fsdp:
+            return contextlib.nullcontext()
+        return self.accelerator.accumulate(self.model)
+
+    def _backward(self, loss: torch.Tensor) -> None:
+        if self.is_fsdp:
+            loss.backward()
+        else:
+            self.accelerator.backward(loss)
+
+    def _loss_for_backward(self, loss: torch.Tensor) -> torch.Tensor:
+        if self.is_fsdp and self.grad_accum > 1:
+            return loss / self.grad_accum
+        return loss
+
+    def _should_step_optimizer(
+        self,
+        completed_step: int,
+        *,
+        end_of_epoch: bool = False,
+        stopping: bool = False,
+    ) -> bool:
+        if not self.is_fsdp:
+            return True
+        return completed_step % max(int(self.grad_accum), 1) == 0 or end_of_epoch or stopping
+
+    def _clip_grad_norm_if_needed(self, *, should_step_optimizer: bool) -> None:
+        if self.max_grad_norm is None or self.max_grad_norm <= 0:
+            return
+        if self.is_fsdp:
+            if should_step_optimizer:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            return
+        if self.accelerator.sync_gradients:
+            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
     def _save(self, no_dist=False):
         rank = int(os.environ.get("RANK", 0))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        checkpoint_num = self._checkpoint_iteration
+        training_state = self.state.state_dict()
 
-        if self.accelerator.num_processes > 1 and not torch.distributed.is_initialized():
+        if self._num_processes() > 1 and not torch.distributed.is_initialized():
             _dist_debug(
                 "skipping checkpoint save because the distributed process group is no longer initialized"
             )
-            return
+            return None
 
-        if self.accelerator.is_main_process:
+        if self._is_main_process():
             logger.info(f"Saving checkpoint at step {self.state.steps} (total: {self.state.total_steps})")
         _dist_debug(
             f"entering _save(checkpoint_num={self._checkpoint_iteration}, "
@@ -218,30 +448,116 @@ class Trainer:
         )
         _dist_debug("waiting for everyone before checkpoint save")
         try:
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
         except (RuntimeError, ValueError) as error:
             if rank == 0:
                 logger.warning(
                     "Skipping checkpoint save because distributed synchronization is unavailable: %s",
                     error,
                 )
-            return
+            return None
         _dist_debug("passed wait_for_everyone before checkpoint save")
 
         self.checkpoint_manager.save(
-            checkpoint_num=self._checkpoint_iteration,
-            model=self.accelerator.unwrap_model(self.model),
+            checkpoint_num=checkpoint_num,
+            model=self._unwrap_model_for_save(),
             optimizer=self.optimizer,
-            training_state=self.state.state_dict(),
+            training_state=training_state,
             scheduler=self.scheduler if self.use_scheduler else None,
-            scaler=self.accelerator.scaler if hasattr(self.accelerator, 'scaler') and self.accelerator.scaler else None,
+            scaler=self._scaler_for_save(),
             loss_calculator=self.loss_calculator,
+            preprocessors=self.preprocessors,
             is_fsdp=self.is_fsdp,
             rank=rank,
             local_rank=local_rank,
         )
-        _dist_debug(f"checkpoint save completed for checkpoint_num={self._checkpoint_iteration}")
+        if self.checkpoint_manager.ray_train_reporting_enabled():
+            if rank == 0:
+                self.checkpoint_manager.write_ray_train_metadata(
+                    checkpoint_num=checkpoint_num,
+                    training_state=training_state,
+                    world_size=world_size,
+                )
+            try:
+                self._wait_for_everyone()
+            except (RuntimeError, ValueError) as error:
+                if rank == 0:
+                    logger.warning(
+                        "Skipping Ray Train checkpoint report because post-save synchronization failed: %s",
+                        error,
+                    )
+                self._checkpoint_iteration += 1
+                return checkpoint_num
+
+            self.checkpoint_manager.report_to_ray_train(
+                checkpoint_num=checkpoint_num,
+                training_state=training_state,
+                rank=rank,
+                world_size=world_size,
+            )
+        if rank == 0:
+            self.checkpoint_manager.prune_old_checkpoints()
+        try:
+            self._wait_for_everyone()
+        except (RuntimeError, ValueError) as error:
+            if rank == 0:
+                logger.warning(
+                    "Checkpoint save completed but post-prune synchronization failed: %s",
+                    error,
+                )
+        _dist_debug(f"checkpoint save completed for checkpoint_num={checkpoint_num}")
+        self._last_checkpoint_total_steps = self.state.total_steps
         self._checkpoint_iteration += 1
+        return checkpoint_num
+
+    def _save_and_notify(self, ctx: Optional[dict[str, Any]] = None, *, reason: str = "periodic"):
+        checkpoint_num = self._save()
+        if checkpoint_num is None:
+            return None
+        checkpoint_path = self.checkpoint_manager.get_checkpoint_path(checkpoint_num)
+        payload = {
+            "checkpoint_num": int(checkpoint_num),
+            "checkpoint_path": checkpoint_path,
+            "reason": str(reason),
+            "training_state": self.state.state_dict(),
+            "output_dir": self.output_dir,
+        }
+        for component in [*self.preprocessors, *self.postprocessors, self.loss_calculator]:
+            hook = getattr(component, "on_checkpoint_saved", None)
+            if not callable(hook):
+                continue
+            try:
+                hook(payload, ctx or {})
+            except BaseException as error:
+                if self._is_main_process():
+                    logger.warning(
+                        "Checkpoint hook failed for %s after checkpoint_%s: %s",
+                        component.__class__.__name__,
+                        checkpoint_num,
+                        error,
+                    )
+        return checkpoint_num
+
+    def _should_skip_final_checkpoint(self) -> bool:
+        return (
+            self._last_checkpoint_total_steps is not None
+            and self._last_checkpoint_total_steps == self.state.total_steps
+        )
+
+    def _shutdown_pipeline_components(self) -> None:
+        for component in [*self.preprocessors, *self.postprocessors, self.loss_calculator]:
+            shutdown = getattr(component, "shutdown", None)
+            if not callable(shutdown):
+                continue
+            try:
+                shutdown()
+            except BaseException as error:
+                if self._is_main_process():
+                    logger.warning(
+                        "Pipeline component shutdown failed for %s: %s",
+                        component.__class__.__name__,
+                        error,
+                    )
 
     def _log_pipeline(self):
         logger.info("Pipeline:")
@@ -253,6 +569,48 @@ class Trainer:
         for p in self.postprocessors:
             logger.info(f"    - {p}")
         logger.info(f"  loss: {self.loss_calculator.__class__.__name__}")
+
+    def _run_validation_callbacks(self, step: int) -> bool:
+        if not self.validation_callbacks or self.validation_every <= 0:
+            return False
+        if step % self.validation_every != 0:
+            return False
+
+        stop_training = False
+        for callback in self.validation_callbacks:
+            result = callback(
+                model=self.model,
+                accelerator=self.accelerator,
+                state=self.state,
+                step=step,
+                output_dir=self.output_dir,
+                metrics_logger=self.metrics_logger,
+            )
+            if result is None:
+                continue
+            if not isinstance(result, dict):
+                raise TypeError(
+                    "Validation callbacks must return a dict of metrics, a dict with "
+                    "stop_training, or None."
+                )
+            stop_training = stop_training or bool(result.get("stop_training", False))
+            if self.metrics_logger is not None and self._is_main_process():
+                for key, value in result.items():
+                    if key == "stop_training":
+                        continue
+                    if isinstance(value, (int, float)):
+                        self.metrics_logger.log_scalar(f"validation/{key}", float(value), step)
+
+        if self._num_processes() > 1 and torch.distributed.is_initialized():
+            stop_tensor = torch.tensor(
+                1 if stop_training else 0,
+                device=self.device,
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(stop_tensor, op=torch.distributed.ReduceOp.MAX)
+            stop_training = bool(stop_tensor.item())
+
+        return stop_training
 
     def _train_accelerate(self, epochs=1, max_steps=None):
         context_manager = contextlib.nullcontext()
@@ -269,10 +627,17 @@ class Trainer:
                 total_batches = None
         start_time = time.time()
 
-        atexit.register(self._save)
+        register_atexit_save = self.save_final_checkpoint or self.checkpoint_every > 0
+        if register_atexit_save:
+            atexit.register(self._save)
 
+        stop_requested = False
         for ep in range(self.state.epoch, epochs):
             dataset = self.dataset
+            try:
+                batches_in_epoch = len(dataset)
+            except TypeError:
+                batches_in_epoch = None
             _dist_debug(f"starting epoch loop ep={ep}")
 
             if self.shuffle_each_epoch:
@@ -281,9 +646,10 @@ class Trainer:
                 elif hasattr(dataset, "sampler") and hasattr(dataset.sampler, "set_epoch"):
                     dataset.sampler.set_epoch(ep)
 
-            for batch in dataset:
+            for batch_idx, batch in enumerate(dataset):
                 if batch is None:
                     break
+                step_start_time = time.perf_counter()
 
                 if self._manual_device_placement:
                     batch = send_to_device(batch, self.device, non_blocking=True)
@@ -296,6 +662,8 @@ class Trainer:
                     "device": self.device,
                     "original_batch": original_batch,
                     "model": self.model,
+                    "output_dir": self.output_dir,
+                    "policy_checkpoint_id": f"{os.path.abspath(self.output_dir)}:step-{self.state.total_steps}",
                 }
 
                 for preprocessor in self.preprocessors:
@@ -308,25 +676,122 @@ class Trainer:
                 if batch is None:
                     continue
 
-                with self.accelerator.accumulate(self.model):
-                    with context_manager:
-                        model_output = self.model(batch, **ctx.get("forward_kwargs", {}))
-                        if not isinstance(model_output, tuple):
-                            model_output = (model_output,)
+                with self._accumulate_context():
+                    # Micro-batching support: when ctx supplies `loss_micro_batch_size`,
+                    # split the batch (and per-sequence ctx tensors) along dim 0 into
+                    # equal-ish chunks, forward+backward each chunk separately, then
+                    # let the outer step's clip + optimizer.step apply once. The loss
+                    # contributions are scaled by 1/num_chunks so the accumulated
+                    # gradient equals the full-batch gradient for sum-style losses
+                    # (DR.GRPO/DR.GSPO) when chunks are equal size; small bias for
+                    # unequal final chunk is negligible at micro-batch >> 1.
+                    micro_bs = int(ctx.get("loss_micro_batch_size") or 0)
+                    batch_size_total = int(batch.shape[0]) if hasattr(batch, "shape") else None
+                    micro_batched = (
+                        micro_bs > 0
+                        and batch_size_total is not None
+                        and batch_size_total > 0
+                    )
+                    if micro_batched:
+                        num_chunks = max((batch_size_total + micro_bs - 1) // micro_bs, 1)
+                        local_chunks = num_chunks
+                        # Synchronize chunk count across ranks so all ranks issue the
+                        # same number of forward+backward passes (each backward triggers
+                        # FSDP's gradient all-reduce). If ranks disagreed on num_chunks
+                        # we'd deadlock at the next collective.
+                        if torch.distributed.is_available() and torch.distributed.is_initialized():
+                            t = torch.tensor([num_chunks], device=self.device, dtype=torch.int64)
+                            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+                            num_chunks = int(t.item())
+                        # Recompute micro_bs given the synchronized num_chunks.
+                        effective_micro_bs = (batch_size_total + num_chunks - 1) // num_chunks if num_chunks > 0 else batch_size_total
+                        _dist_debug(
+                            "loss microbatch start "
+                            f"batch_size={batch_size_total} micro_bs={micro_bs} "
+                            f"local_chunks={local_chunks} synced_chunks={num_chunks} "
+                            f"effective_micro_bs={effective_micro_bs}"
+                        )
 
-                        for postprocessor in self.postprocessors:
-                            model_output, ctx = postprocessor.process(model_output, ctx)
+                        full_forward_kwargs = dict(ctx.get("forward_kwargs", {}))
+                        total_loss_scalar = 0.0
+                        last_loss_output = None
+                        micro_metric_rows: list[dict[str, Any]] = []
+                        for chunk_idx in range(num_chunks):
+                            s = chunk_idx * effective_micro_bs
+                            e = min(s + effective_micro_bs, batch_size_total)
+                            has_real_rows = s < e
+                            if s >= e:
+                                # No real records on this rank for this chunk slot:
+                                # repeat the last row to keep collective ops aligned;
+                                # the loss contribution is explicitly zeroed below.
+                                s, e = batch_size_total - 1, batch_size_total
+                            chunk_batch = batch[s:e]
+                            chunk_fwd_kwargs = _slice_batch_mapping(
+                                full_forward_kwargs,
+                                s,
+                                e,
+                                batch_size_total,
+                            )
+                            chunk_ctx = _slice_batch_mapping(ctx, s, e, batch_size_total)
+                            chunk_ctx["forward_kwargs"] = chunk_fwd_kwargs
+                            if "mask" in chunk_ctx and isinstance(chunk_ctx["mask"], torch.Tensor):
+                                if not has_real_rows:
+                                    chunk_ctx["mask"] = torch.zeros_like(chunk_ctx["mask"])
+                            if "advantages" in chunk_ctx and isinstance(chunk_ctx["advantages"], torch.Tensor):
+                                if not has_real_rows:
+                                    chunk_ctx["advantages"] = torch.zeros_like(chunk_ctx["advantages"])
+                            with context_manager:
+                                model_output = self.model(chunk_batch, **chunk_fwd_kwargs)
+                                if not isinstance(model_output, tuple):
+                                    model_output = (model_output,)
+                                for postprocessor in self.postprocessors:
+                                    model_output, chunk_ctx = postprocessor.process(model_output, chunk_ctx)
+                                loss_output = self.loss_calculator.compute(model_output, chunk_ctx)
+                                chunk_loss = loss_output.loss / max(num_chunks, 1)
+                            if has_real_rows:
+                                micro_metric_rows.append(dict(loss_output.metrics))
+                            self._backward(self._loss_for_backward(chunk_loss))
+                            total_loss_scalar += float(chunk_loss.item()) * num_chunks
+                            last_loss_output = loss_output
+                        _dist_debug("loss microbatch backward complete")
+                        loss = torch.tensor(total_loss_scalar / max(num_chunks, 1), device=self.device)
+                        micro_metrics = _mean_numeric_metric_dicts(micro_metric_rows)
+                        micro_metrics["loss_microbatch_real_chunks"] = float(len(micro_metric_rows))
+                        micro_metrics["loss_microbatch_synced_chunks"] = float(num_chunks)
+                        micro_metrics["loss_microbatch_effective_micro_bs"] = float(effective_micro_bs)
+                        loss_output = LossOutput(
+                            loss=loss,
+                            metrics=micro_metrics if micro_metrics else (
+                                dict(last_loss_output.metrics) if last_loss_output is not None else {}
+                            ),
+                        )
+                    else:
+                        with context_manager:
+                            model_output = self.model(batch, **ctx.get("forward_kwargs", {}))
+                            if not isinstance(model_output, tuple):
+                                model_output = (model_output,)
 
-                        loss_output = self.loss_calculator.compute(model_output, ctx)
-                        loss = loss_output.loss
+                            for postprocessor in self.postprocessors:
+                                model_output, ctx = postprocessor.process(model_output, ctx)
 
-                    self.accelerator.backward(loss)
+                            loss_output = self.loss_calculator.compute(model_output, ctx)
+                            loss = loss_output.loss
 
-                    if self.max_grad_norm is not None and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self._backward(self._loss_for_backward(loss))
 
                     completed_step = self.state.steps + 1
                     completed_total_steps = self.state.total_steps + 1
+                    end_of_epoch = (
+                        batches_in_epoch is not None and batch_idx + 1 >= batches_in_epoch
+                    )
+                    stopping_for_max = max_steps is not None and completed_total_steps >= max_steps
+                    should_step_optimizer = self._should_step_optimizer(
+                        completed_step,
+                        end_of_epoch=end_of_epoch,
+                        stopping=stopping_for_max,
+                    )
+
+                    self._clip_grad_norm_if_needed(should_step_optimizer=should_step_optimizer)
 
                     # Log gradients AFTER clip_grad_norm_ to avoid FSDP2 sync issues
                     # clip_grad_norm_ involves all-reduce, so all ranks must finish it first
@@ -334,14 +799,25 @@ class Trainer:
                         hasattr(self.metrics_logger, 'log_gradients') and
                         hasattr(self.metrics_logger, 'gradient_log_every') and
                         completed_step % self.metrics_logger.gradient_log_every == 0 and
-                        self.accelerator.is_main_process):
+                        self._is_main_process()):
                         self.metrics_logger.log_gradients(self.model, completed_total_steps)
                     batch_loss = loss.item()
-                    self.optimizer.step()
-                    if self.use_scheduler and self.scheduler:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                    if should_step_optimizer:
+                        self.optimizer.step()
+                        if self.is_fsdp and getattr(self.model, "_ditty_float8_training_enabled", False):
+                            _precompute_float8_fsdp_scales_if_available(self.model)
+                        if self.use_scheduler and self.scheduler:
+                            self.scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
 
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                    perf_metrics = _training_perf_metrics(
+                        batch=batch,
+                        ctx=ctx,
+                        elapsed_seconds=time.perf_counter() - step_start_time,
+                        device=self.device,
+                    )
                     time_elapsed = time.time() - start_time
                     current_epoch_decimal, batch_info, progress_info = _format_progress_state(
                         total_batches=total_batches,
@@ -351,15 +827,19 @@ class Trainer:
                         time_elapsed=time_elapsed,
                     )
 
-                    if completed_step % self.log_every == 0 and self.accelerator.is_main_process:
-                        metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in loss_output.metrics.items())
+                    log_metrics = {**loss_output.metrics, **perf_metrics}
+                    if completed_step % self.log_every == 0:
+                        log_metrics = _distributed_mean_metrics(log_metrics)
+
+                    if completed_step % self.log_every == 0 and self._is_main_process():
+                        metrics_str = " | ".join(f"{k}: {v:.4f}" for k, v in log_metrics.items())
                         logger.info(
                             f"Epoch {current_epoch_decimal:.2f} | {batch_info} | "
                             f"{metrics_str} | {progress_info}"
                         )
 
                         if self.metrics_logger:
-                            for k, v in loss_output.metrics.items():
+                            for k, v in log_metrics.items():
                                 self.metrics_logger.log_scalar(f"train/{k}", v, completed_total_steps)
                             # Log learning rate if supported
                             if hasattr(self.metrics_logger, 'log_lr'):
@@ -372,32 +852,67 @@ class Trainer:
                 self.state.steps = completed_step
                 self.state.total_steps = completed_total_steps
 
-                if max_steps is not None and self.state.total_steps >= max_steps:
+                if self._run_validation_callbacks(completed_total_steps):
+                    stop_requested = True
                     break
 
-                if self.checkpoint_every > 0 and self.state.steps % self.checkpoint_every == 0:
-                    _dist_debug(f"triggering periodic checkpoint at step={self.state.steps}")
-                    self._save()
+                forced_checkpoint = bool(ctx.get("force_checkpoint_after_step"))
+                saved_checkpoint = False
+                if forced_checkpoint:
+                    _dist_debug(
+                        "triggering forced checkpoint at "
+                        f"step={self.state.steps} reason={ctx.get('checkpoint_reason', 'requested')}"
+                    )
+                    saved_checkpoint = self._save_and_notify(
+                        ctx,
+                        reason=str(ctx.get("checkpoint_reason") or "requested"),
+                    ) is not None
 
+                if (
+                    self.checkpoint_every > 0
+                    and self.state.steps % self.checkpoint_every == 0
+                    and not saved_checkpoint
+                ):
+                    _dist_debug(f"triggering periodic checkpoint at step={self.state.steps}")
+                    self._save_and_notify(ctx, reason="periodic")
+
+                if max_steps is not None and self.state.total_steps >= max_steps:
+                    stop_requested = True
+                    break
+
+            if stop_requested:
+                _dist_debug("max_steps reached, leaving epoch loop without resetting step state")
+                break
             _dist_debug(f"epoch {ep} complete, waiting for everyone before epoch increment")
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
             _dist_debug(f"epoch {ep} post-wait complete")
             self.state.epoch += 1
             self.state.steps = 0
 
-        atexit.unregister(self._save)
+        if register_atexit_save:
+            atexit.unregister(self._save)
         if self.save_final_checkpoint:
-            _dist_debug("training loop complete, invoking final _save()")
-            self._save()
-            _dist_debug("final _save() returned")
+            if self._should_skip_final_checkpoint():
+                _dist_debug("training loop complete, skipping duplicate final checkpoint")
+                if self._is_main_process():
+                    logger.info(
+                        "Skipping final checkpoint at step %s (total: %s); latest checkpoint already covers this state",
+                        self.state.steps,
+                        self.state.total_steps,
+                    )
+                self._wait_for_everyone()
+            else:
+                _dist_debug("training loop complete, invoking final _save()")
+                self._save_and_notify(reason="final")
+                _dist_debug("final _save() returned")
         else:
             _dist_debug("training loop complete, final checkpoint disabled")
-            self.accelerator.wait_for_everyone()
+            self._wait_for_everyone()
 
         return self.state.global_loss / self.state.total_steps if self.state.total_steps > 0 else 0
 
     def train(self, epochs=1, max_steps=None):
-        if self.accelerator.is_main_process:
+        if self._is_main_process():
             logger.info("***** Running training *****")
             try:
                 logger.info(f"  Num examples = {len(self.dataset):,}")
@@ -413,4 +928,7 @@ class Trainer:
             )
             logger.info(f"  Loss calculator = {self.loss_calculator.__class__.__name__}")
 
-        return self._train_accelerate(epochs=epochs, max_steps=max_steps)
+        try:
+            return self._train_accelerate(epochs=epochs, max_steps=max_steps)
+        finally:
+            self._shutdown_pipeline_components()
